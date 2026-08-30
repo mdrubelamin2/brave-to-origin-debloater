@@ -468,14 +468,17 @@ Claims in earlier versions of this document that source review disproved:
 
 ## Known limitations
 
-**Windows is verified by source and sandbox, not on a Windows machine.** The
-registry is faked by a JSON file and the seams are rewritten in a copy, the same way
-the Linux backend is tested. Nothing has run against a real registry, a real Brave
-install, or PowerShell 5.1 — the suite runs on PowerShell 7, so `tests/Test-Ps51Compat.ps1`
-walks the AST for constructs 5.1 rejects. Confirm on a real machine before trusting it.
+**All three platforms are confirmed working on real machines** — macOS, Fedora with
+GNOME, and Windows 11 with PowerShell 5.1. What has been exercised there is `activate`
+and `status`; **`deactivate` has only been proven by the test suites**, not by a real
+rollback on Linux or Windows. That is the half worth trying next, since it is the half
+that touches values it did not write.
 
-**Linux is confirmed working** on Fedora with GNOME. The remaining Linux unknowns are
-the snap refusal and the Flatpak policy linking, neither of which was exercised there.
+Three things still rest on source review alone: the **snap refusal** and the **Flatpak**
+policy linking on Linux, and on Windows the **separate-admin-account** case, where "Run
+as administrator" with a different account points `%LOCALAPPDATA%` at the wrong profile.
+The tool refuses rather than half-applying when it detects that, but the detection
+itself is untested against a real second account.
 
 **Reboot persistence is untested.** There are community reports that `mdmclient` removes
 raw plists from `/Library/Managed Preferences` at boot unless they arrive via a signed
