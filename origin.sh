@@ -592,7 +592,7 @@ if changed:
         die(f"write failed, left untouched ({exc})")
 
 verb = "written" if mode == "set" else "cleared"
-print(f"    {label}: {changed} pref(s) {verb}", file=sys.stderr)
+print(f"    {label}: {changed} pref(s) {verb}")
 sys.exit(1 if refused else 0)
 PY
   return $rc
@@ -864,7 +864,8 @@ cmd_activate() {
   else
     warn "Local State not found; metrics pref skipped."
   fi
-  ok "${#POLICIES[@]} policy key(s) and ${#captured_files[@]} pref file(s) read"
+  local ls_note="Local State"; [[ $ls_captured -eq 1 ]] || ls_note="Local State NOT read"
+  ok "${#POLICIES[@]} policy key(s), ${#captured_files[@]} profile pref file(s), ${ls_note}"
 
   # ── Receipt, before the first write ────────────────────────────────────────
   local existing; existing=$(prior_receipt)
@@ -929,6 +930,10 @@ cmd_activate() {
 
   section "Result"
   echo "  Policies written : ${applied} / ${#POLICIES[@]}"
+  # Stated here as well as inline, so the outcome survives however the caller
+  # consumed the output.
+  local ls_state="written"; [[ $ls_captured -eq 1 ]] || ls_state="${YELLOW}skipped${RESET}"
+  echo "  Prefs written    : ${#captured_files[@]} profile file(s), Local State ${ls_state}"
   [[ $inert   -gt 0 ]] && echo "  Inert this build : ${inert} ${DIM}(written, ignored until Brave ships them)${RESET}"
   [[ $failed  -gt 0 ]] && echo "  ${RED}Failed writes    : ${failed}${RESET}"
   [[ $JSON_FAILURES -gt 0 ]] && echo "  ${RED}Pref files failed: ${JSON_FAILURES}${RESET}"

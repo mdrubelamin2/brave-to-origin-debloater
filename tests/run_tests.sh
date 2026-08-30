@@ -346,6 +346,30 @@ t_vanished_profile_does_not_wedge_deactivate() {
   assert_file_absent "${RECEIPT_DIR}/com.brave.Browser.user.json" || return 1
 }
 
+# Progress belongs on stdout. When these lines went to stderr, whether they
+# appeared at all — and in what order — depended on how the caller consumed the
+# two streams, so a successful run could look like it had silently done nothing.
+t_pref_progress_goes_to_stdout() {
+  local out
+  out=$(run activate 2>/dev/null)
+  case "$out" in *"Default/Preferences"*) : ;;
+    *) _fail_msg+="      profile pref confirmation missing from stdout"$'\n'; return 1 ;;
+  esac
+  case "$out" in *"Local State"*) : ;;
+    *) _fail_msg+="      Local State confirmation missing from stdout"$'\n'; return 1 ;;
+  esac
+}
+
+# And the Result block must state the pref outcome on its own, so the summary is
+# complete even if the inline lines are lost.
+t_result_summarises_prefs() {
+  local out
+  out=$(run activate 2>/dev/null)
+  case "$out" in *"Prefs written"*) : ;;
+    *) _fail_msg+="      Result block does not summarise prefs"$'\n'; return 1 ;;
+  esac
+}
+
 # ── install.sh ───────────────────────────────────────────────────────────────
 # The bootstrap the curl one-liner runs. Sandboxed the same way: only the two
 # root preconditions and the /Applications lookup are rewritten.
@@ -462,6 +486,8 @@ test_case "refuses to run while Brave is running"      t_refuses_while_brave_run
 test_case "interrupted activate is rollbackable"       t_interrupted_activate_is_rollbackable
 test_case "status runs clean before and after"         t_status_runs_clean_before_and_after
 test_case "unreadable prefs keeps the receipt"         t_unreadable_prefs_keeps_receipt
+test_case "pref progress goes to stdout"               t_pref_progress_goes_to_stdout
+test_case "result block summarises prefs"              t_result_summarises_prefs
 test_case "status works with only a Default profile"    t_status_with_only_default_profile
 test_case "activate works with only a Default profile"  t_activate_with_only_default_profile
 test_case "corrupt prior receipt refuses activate"     t_corrupt_prior_receipt_refuses_activate
