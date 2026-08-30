@@ -1,4 +1,4 @@
-# Brave to Origin — policy clone for standard Brave (macOS and Linux)
+# Brave to Origin — policy clone for standard Brave (macOS, Linux, Windows)
 
 Applies the 16 preferences that **Brave Origin upgrade mode** enforces, using Brave's
 own enterprise-policy mechanism, plus the standalone-build defaults reachable without
@@ -12,8 +12,16 @@ shipped macOS binary. Claims that source review disproved are listed in
 
 ## Run it without cloning
 
+**macOS and Linux:**
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/mdrubelamin2/brave-to-origin/main/install.sh | sudo bash
+```
+
+**Windows**, in an elevated PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/mdrubelamin2/brave-to-origin/main/install.ps1 | iex
 ```
 
 It finds your installed Brave channels, asks which one and whether to activate,
@@ -27,6 +35,11 @@ Non-interactive, for scripts:
 ... | sudo bash -s -- activate
 ... | sudo bash -s -- status --channel com.brave.Browser.beta
 ... | sudo bash -s -- deactivate
+```
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/mdrubelamin2/brave-to-origin/main/install.ps1))) -Action activate
+& ([scriptblock]::Create((irm ...))) -Action status -Channel com.brave.Browser.beta
 ```
 
 > **This is `curl | sudo bash`.** You are running code from the internet as root on the
@@ -75,8 +88,10 @@ Verify at `brave://policy`.
 ### Tests
 
 ```bash
-./tests/run_tests.sh            # all 51
-./tests/run_tests.sh receipt    # only tests whose name matches
+./tests/run_tests.sh              # macOS + Linux, 51 cases
+pwsh tests/Run-Tests.ps1          # Windows, 18 cases
+pwsh tests/Test-Ps51Compat.ps1    # PowerShell 5.1 syntax gate
+./tests/check_release.sh v1.2.0   # release gate: pins, checksums, all suites
 ```
 
 No `sudo`, no Brave install, nothing written outside `$TMPDIR`. The Linux backend is
@@ -287,10 +302,11 @@ Nightly is `Channel::CANARY` in `version_info`; there is no `NIGHTLY` enumerator
 
 ### Platforms
 
-| | Policy store | Scope | Nudge |
-|---|---|---|---|
-| macOS | `/Library/Managed Preferences/<user>/<bundle-id>.plist`, shared with every other tool | user, or machine with `--machine` | `killall cfprefsd` |
-| Linux | `/etc/brave/policies/managed/brave-to-origin.json`, a file of our own | machine only | none |
+| | Policy store | Scope | Per-channel? | Nudge |
+|---|---|---|---|---|
+| macOS | `/Library/Managed Preferences/<user>/<bundle-id>.plist`, shared | user, or machine with `--machine` | yes, one plist per bundle ID | `killall cfprefsd` |
+| Linux | `/etc/brave/policies/managed/brave-to-origin.json`, ours alone | machine only | **no**, one directory for all channels | none |
+| Windows | `HKLM\SOFTWARE\Policies\BraveSoftware\Brave`, shared | machine, or HKCU with `-User` | **no**, one key for all channels | none |
 
 The two backends differ more than the table suggests, and the difference is in our
 favour on Linux. macOS forces every tool into one shared plist, which is why the
@@ -310,6 +326,34 @@ names the channels holding it.
 **Files sorting after ours override ours.** `managed/` is applied in lexicographic
 order, last file wins. `status` lists every other file there that sets any of our keys
 and says which way it sorts, because an MDM-deployed `zz-corp.json` silently beats us.
+
+### Windows
+
+The registry key is **channel-independent** — brave-core patches out the product
+suffix, so stable, beta, dev and nightly all read `...\Policies\BraveSoftware\Brave`.
+That is the Linux problem again, so the same channel refcount applies. But the key is
+shared with MDM and anything else writing Brave policy, so it *also* needs the macOS
+model: every value's prior is recorded with its registry type and restored as that
+type. Windows is the only platform that needs both.
+
+Values are `REG_DWORD` 0/1. The reserved `Recommended` and `3rdparty` subkeys are never
+touched, and the key itself is removed only when it holds no values and no subkeys at
+all. A prior of a type that cannot be reproduced faithfully — `REG_BINARY`,
+`REG_MULTI_SZ` — is refused rather than overwritten.
+
+`-User` writes `HKCU` instead and needs no elevation, which is the way in on a locked
+down machine. Brave reads both hives, but **HKLM wins**, so `-User` cannot override a
+policy an administrator already set.
+
+None of these policies is `sensitive: true`, so unlike macOS none of them is filtered
+on a machine that is not domain-joined — consumer Windows honours all of them. Every
+one is `dynamic_refresh: false`, so **restart Brave**. `gpupdate /force` shortens the
+≤15-minute policy reload but does not remove the restart.
+
+The profile prefs are edited as raw JSON text rather than parsed and re-serialised,
+because PowerShell 5.1's `ConvertFrom-Json` collapses `2.0` to `2` and Chromium then
+discards the pref as the wrong type. Everything outside the edited span stays
+byte-identical.
 
 `BraveVPNDisabled` is **compiled out on Linux** — `enable_brave_vpn_v1/v2` list
 `is_win || is_android || is_mac || is_ios`, with no `is_linux`. It is reported as
@@ -424,12 +468,14 @@ Claims in earlier versions of this document that source review disproved:
 
 ## Known limitations
 
-**Linux is verified by source and sandbox, not on a Linux machine.** Every path,
-directory and package name above was read from brave-core at `v1.94.117` and from the
-shipped `.deb` file lists, and the backend is exercised by the test suite — but no run
-against a real Linux Brave has happened yet. The parts most worth confirming there:
-that Brave picks the file up without a restart, that snap really is blocked, and that
-Flatpak really does link the host policies in.
+**Windows is verified by source and sandbox, not on a Windows machine.** The
+registry is faked by a JSON file and the seams are rewritten in a copy, the same way
+the Linux backend is tested. Nothing has run against a real registry, a real Brave
+install, or PowerShell 5.1 — the suite runs on PowerShell 7, so `tests/Test-Ps51Compat.ps1`
+walks the AST for constructs 5.1 rejects. Confirm on a real machine before trusting it.
+
+**Linux is confirmed working** on Fedora with GNOME. The remaining Linux unknowns are
+the snap refusal and the Flatpak policy linking, neither of which was exercised there.
 
 **Reboot persistence is untested.** There are community reports that `mdmclient` removes
 raw plists from `/Library/Managed Preferences` at boot unless they arrive via a signed
