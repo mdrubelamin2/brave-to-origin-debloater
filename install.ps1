@@ -37,16 +37,11 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$ValidActions = @('activate', 'deactivate', 'status')
-if ($Action -and $ValidActions -notcontains $Action) {
-    [Console]::Error.WriteLine("Unknown -Action '$Action'. Use one of: $($ValidActions -join ', ')")
-    exit 1
-}
 
 $Repo = 'mdrubelamin2/brave-to-origin'
 # Pinned, not a moving branch: piping a URL to an elevated shell should not
 # mean "whatever that branch says today". Bump both together at a release.
-$PinnedRef = 'v1.2.1'
+$PinnedRef = 'v1.2.2'
 $PinnedSha256 = '1a2f3e2c46108197810aaf7d8aefcb2dc3e371ce474d3f2fa917d5f99c4590e3'
 
 $Ref = if ($env:ORIGIN_REF) { $env:ORIGIN_REF } else { $PinnedRef }
@@ -66,16 +61,32 @@ if ($CanColor) {
 function Write-Info { param([string]$Message) Write-Output ("{0}[*]{1} {2}" -f $Cyan, $Reset, $Message) }
 function Write-Ok { param([string]$Message) Write-Output ("{0}[+]{1} {2}" -f $Green, $Reset, $Message) }
 function Write-Warn { param([string]$Message) Write-Output ("{0}[!]{1} {2}" -f $Yellow, $Reset, $Message) }
-function Stop-WithError {
-    # -KeepOpen: both documented forms run this file as a scriptblock inside the
-    # user's own session, so `exit` closes the window it printed into. A message
-    # whose whole point is a command to run next has to outlive the run.
-    param([string]$Message, [switch]$KeepOpen)
-    [Console]::Error.WriteLine(("{0}[x]{1} {2}" -f $Red, $Reset, $Message))
-    if ($KeepOpen -and [Environment]::UserInteractive) {
+function Complete-Run {
+    # Both documented forms run this file as a scriptblock inside the user's own
+    # session, so `exit` closes the window everything was printed into. Errors
+    # and instructions are unreadable unless the run waits.
+    #
+    # IsInputRedirected, not UserInteractive: under `irm | iex` the pipeline is
+    # internal to PowerShell and the console's own stdin is still a terminal, so
+    # this pauses there. When stdin is piped from a file or a CI runner it is
+    # redirected, and the run exits straight away rather than hanging forever.
+    param([int]$Code)
+    if (-not [Console]::IsInputRedirected) {
         try { Read-Host 'Press Enter to close' | Out-Null } catch { }
     }
-    exit 1
+    exit $Code
+}
+function Stop-WithError {
+    param([string]$Message, [switch]$KeepOpen)
+    [Console]::Error.WriteLine(("{0}[x]{1} {2}" -f $Red, $Reset, $Message))
+    Complete-Run 1
+}
+
+# Validated here rather than with [ValidateSet] on the parameter — see the note
+# above the param block for why that attribute cannot survive `iex`.
+$ValidActions = @('activate', 'deactivate', 'status')
+if ($Action -and $ValidActions -notcontains $Action) {
+    Stop-WithError ("Unknown -Action '{0}'. Use one of: {1}" -f $Action, ($ValidActions -join ', '))
 }
 
 # $Ref, not 'main': printing a command that points at a moving branch undoes the
@@ -333,11 +344,5 @@ if ($ExitCode -eq 0 -and $Action -eq 'activate') {
     Write-Output ''
     Write-Output ("{0}To undo this later, without cloning anything:{1}" -f $Dim, $Reset)
     Write-Output ("  {0} -Action deactivate{1}{2}" -f $ArgCommand, $ChannelArg, $undoUser)
-    # Same reason Stop-WithError has -KeepOpen: run as a scriptblock, the `exit`
-    # below closes the window these two lines were just printed into. Gated on
-    # UserInteractive so a scripted or CI run still exits straight away.
-    if ([Environment]::UserInteractive) {
-        try { Read-Host 'Press Enter to close' | Out-Null } catch { }
-    }
 }
-exit $ExitCode
+Complete-Run $ExitCode

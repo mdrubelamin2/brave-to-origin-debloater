@@ -282,6 +282,33 @@ Test-Case 'installer survives being run through iex with no arguments' {
     (Assert-True ($joined -match 'Brave to Origin') 'must reach the banner')
 }
 
+# Every exit in this file happens inside the user's own session, so a run that
+# exits without pausing destroys the window before its message can be read.
+# That is how a failed run looks like "it printed two lines and vanished".
+Test-Case 'installer pauses before exiting an interactive run' {
+    $inst = New-InstallerSandbox -Root $script:S.Root -ScanRoot (Join-Path $script:S.Root 'ProgramFiles')
+    $text = Get-Content -Raw $inst
+    # No bare `exit` may remain outside the one helper that pauses first.
+    $bare = @([regex]::Matches($text, '(?m)^\s*exit\s'))
+    (Assert-True ($bare.Count -le 1) "every exit must route through Complete-Run (found $($bare.Count))") -and
+    (Assert-True ($text -match 'IsInputRedirected') 'pause must be gated on redirected stdin, not UserInteractive')
+}
+
+# ...and it must NOT pause when stdin is redirected, or CI hangs forever.
+Test-Case 'installer does not hang when stdin is redirected' {
+    $inst = New-InstallerSandbox -Root $script:S.Root -ScanRoot (Join-Path $script:S.Root 'ProgramFiles')
+    $job = Start-Job -ScriptBlock {
+        param($i)
+        '' | & pwsh -NoProfile -File $i -Action bogus 2>&1
+        $LASTEXITCODE
+    } -ArgumentList $inst
+    $done = Wait-Job $job -Timeout 45
+    $out = if ($done) { Receive-Job $job } else { '' }
+    Remove-Job $job -Force -EA SilentlyContinue
+    (Assert-True ($null -ne $done) 'must not hang waiting on a prompt') -and
+    (Assert-True (($out -join "`n") -match 'Unknown -Action') 'must still report the bad action')
+}
+
 # --- summary -----------------------------------------------------------------
 Write-Host ''
 if ($script:Fail -eq 0) {

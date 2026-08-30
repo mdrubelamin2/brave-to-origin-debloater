@@ -89,9 +89,9 @@ Verify at `brave://policy`.
 
 ```bash
 ./tests/run_tests.sh              # macOS + Linux, 51 cases
-pwsh tests/Run-Tests.ps1          # Windows, 19 cases
+pwsh tests/Run-Tests.ps1          # Windows, 21 cases
 pwsh tests/Test-Ps51Compat.ps1    # PowerShell 5.1 syntax gate
-./tests/check_release.sh v1.2.1   # release gate: pins, checksums, all suites
+./tests/check_release.sh v1.2.2   # release gate: pins, checksums, all suites
 ```
 
 No `sudo`, no Brave install, nothing written outside `$TMPDIR`. The Linux backend is
