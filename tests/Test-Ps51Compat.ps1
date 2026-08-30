@@ -116,6 +116,27 @@ foreach ($file in $Path) {
     }
 }
 
+# PowerShell 5.1 reads a BOM-less script file as ANSI, not UTF-8. Any non-ASCII
+# byte is then mis-decoded, and a mangled character mid-line produces a parse
+# error nowhere near the real cause: an em dash before the word "left" once
+# surfaced as "Unexpected token 'left' in expression or statement". Staying
+# ASCII removes the dependency on how the file is read, which a BOM only papers
+# over. Decorative dashes are not worth a class of bug this hard to read.
+foreach ($file in $Path) {
+    if (-not (Test-Path $file)) { continue }
+    $bytes = [System.IO.File]::ReadAllBytes($file)
+    for ($i = 0; $i -lt $bytes.Length; $i++) {
+        if ($bytes[$i] -gt 127) {
+            # Report the line, not the byte offset, so it can be found.
+            $prefix = [System.Text.Encoding]::ASCII.GetString($bytes, 0, $i)
+            $line = ($prefix -split "`n").Count
+            Add-Finding $file $line ("non-ASCII byte 0x{0:X2}" -f $bytes[$i]) `
+                'PowerShell 5.1 decodes a BOM-less file as ANSI; keep it ASCII'
+            break
+        }
+    }
+}
+
 if ($findings.Count -eq 0) {
     Write-Host "PowerShell 5.1 compatibility: clean ($($Path.Count) file(s))"
     exit 0

@@ -1,5 +1,5 @@
 # =============================================================================
-# Brave Origin — policy clone for standard Brave on Windows
+# Brave Origin - policy clone for standard Brave on Windows
 # =============================================================================
 #
 # The Windows half of origin.sh. Same three commands, same guarantees, same
@@ -8,11 +8,11 @@
 # THE WINDOWS POLICY BACKEND
 #   Brave reads HKLM\SOFTWARE\Policies\BraveSoftware\Brave and the HKCU key of
 #   the same name, HKLM winning on conflict. brave-core patches the product
-#   suffix out of the policy path, so that ONE key serves every channel — the
+#   suffix out of the policy path, so that ONE key serves every channel - the
 #   Linux situation, where activating stable also policies beta.
 #
 #   But unlike Linux's own file under managed/, this key is shared with MDM,
-#   Group Policy and every other tool that writes Brave policy — the macOS
+#   Group Policy and every other tool that writes Brave policy - the macOS
 #   situation, where a prior value has to be captured with its type and put
 #   back exactly.
 #
@@ -44,7 +44,7 @@
 #   .\origin.ps1 activate|deactivate|status [-User] [-Channel <id>]
 #                                           [-DryRun] [-NoColor]
 #
-# Restart Brave afterwards — every policy is dynamic_refresh:false. `gpupdate
+# Restart Brave afterwards - every policy is dynamic_refresh:false. `gpupdate
 # /force` shortens the <=15-minute policy reload; it does not remove the
 # restart. Verify at brave://policy.
 # =============================================================================
@@ -60,7 +60,7 @@ param(
     # -Channel reads the same on every platform.
     [string]$Channel,
 
-    # Write HKCU instead of HKLM. Needs no elevation, and Brave reads it — but
+    # Write HKCU instead of HKLM. Needs no elevation, and Brave reads it - but
     # an HKLM value of the same name wins, so this cannot override a policy an
     # administrator or an MDM has already set.
     [switch]$User,
@@ -76,7 +76,7 @@ $ErrorActionPreference = 'Stop'
 # tell "rolled back" from "rolled back except for three values".
 $script:ExitCode = 0
 
-# ── Platform ─────────────────────────────────────────────────────────────────
+# -- Platform -----------------------------------------------------------------
 # One line, one place to look, one place to override. $IsWindows does not exist
 # in Windows PowerShell 5.1, which is what every Windows 10 and 11 box ships.
 $script:IsWindowsHost = ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT)
@@ -91,7 +91,7 @@ $script:ValidatedAgainst = '1.94.117'
 # be useless, so the installer sets this to the command the user actually ran.
 $script:SelfCommand = if ($env:ORIGIN_INVOCATION) { $env:ORIGIN_INVOCATION } else { '.\origin.ps1' }
 
-# ── Output ───────────────────────────────────────────────────────────────────
+# -- Output -------------------------------------------------------------------
 # Write-Host cannot be redirected in 5.1, so everything goes to the success
 # stream and errors to stderr. Colour is ANSI, off unless the host says it can
 # render it: 5.1's console does not enable virtual terminal sequences on its
@@ -144,7 +144,7 @@ if (-not $script:IsWindowsHost) {
     Stop-WithError 'This script supports Windows only. Use origin.sh on macOS and Linux.'
 }
 
-# ── Path roots ───────────────────────────────────────────────────────────────
+# -- Path roots ---------------------------------------------------------------
 # Every root this script can touch, one per line, so there is exactly one place
 # to look and one place to redirect.
 $script:PolicyKeyPathMachine = 'HKLM:\SOFTWARE\Policies\BraveSoftware\Brave'
@@ -165,7 +165,7 @@ $script:Scope = if ($User) { 'user' } else { 'machine' }
 # own `3rdparty`. Removing either would take policy nothing here ever wrote.
 $script:ReservedSubKeys = @('Recommended', '3rdparty')
 
-# ── Registry seam ────────────────────────────────────────────────────────────
+# -- Registry seam ------------------------------------------------------------
 # Every registry read and write in this script goes through these six
 # functions and nothing else. They are the only code here that cannot run
 # anywhere but Windows.
@@ -187,7 +187,7 @@ function Get-PolicyValueRaw {
 }
 
 function Set-PolicyValueRaw {
-    # Creates the key if it is absent. Never verifies — the caller reads the
+    # Creates the key if it is absent. Never verifies - the caller reads the
     # value back, because a write that reports success and did not land is the
     # failure this whole tool exists to make visible.
     param([string]$KeyPath, [string]$Name, $Value, [string]$Type)
@@ -242,7 +242,7 @@ function Get-UpdaterVersion {
 
 function Test-Elevated {
     # Administrators-group membership of the *current token*, which is what
-    # decides whether HKLM is writable — not whether the account is an admin.
+    # decides whether HKLM is writable - not whether the account is an admin.
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -290,7 +290,7 @@ function Protect-ReceiptDirectory {
     Set-Acl -LiteralPath $Path -AclObject $acl
 }
 
-# ── The 16 Brave Origin policies ─────────────────────────────────────────────
+# -- The 16 Brave Origin policies ---------------------------------------------
 # brave_origin_service_factory.cc: kBraveOriginBrowserMetadata (4) and
 # kBraveOriginProfileMetadata (12). Keys via brave_simple_policy_map.h.
 # Booleans are REG_DWORD 0/1 on Windows; there is no REG_SZ "true".
@@ -327,18 +327,18 @@ $script:ProfilePrefs = @(
 )
 # Crash/metrics reporting is a pref, not the MetricsReportingEnabled policy:
 # that policy is sensitive:true, and origin.sh's reasoning for preferring the
-# pref holds here too — the pref works whatever the management state is.
+# pref holds here too - the pref works whatever the management state is.
 $script:LocalStatePrefs = @(
     @{ Name = 'user_experience_metrics.reporting_enabled'; Value = $false }
 )
 
 # Registry types whose value can be put back exactly as it was found. A
 # REG_BINARY or REG_MULTI_SZ has no faithful single-value representation in a
-# JSON receipt, and writing a substitute would destroy the original — those
+# JSON receipt, and writing a substitute would destroy the original - those
 # are refused, never guessed at.
 $script:RestorableKinds = @('String', 'ExpandString', 'DWord', 'QWord')
 
-# ── Channels ─────────────────────────────────────────────────────────────────
+# -- Channels -----------------------------------------------------------------
 # One policy key serves all four, so these differ only in where they are
 # installed, where their profile lives, and which updater GUID reports their
 # version.
@@ -434,7 +434,7 @@ function Get-BraveVersion {
         $pv = Get-UpdaterVersion -Guid $ChannelInfo.Guid -Hive $hive
         if ($pv) { return $pv }
         # Second: the versioned subdirectory beside brave.exe. Parsed as
-        # [version], never sorted as text — "1.94.117" sorts after "1.100.4".
+        # [version], never sorted as text - "1.94.117" sorts after "1.100.4".
         $best = $null
         foreach ($dir in @(Get-ChildItem -LiteralPath $Install.AppDir -Directory -ErrorAction SilentlyContinue)) {
             $parsed = $null
@@ -454,7 +454,7 @@ function Get-BraveVersion {
     return 'unknown'
 }
 
-# ── Capability probe ─────────────────────────────────────────────────────────
+# -- Capability probe ---------------------------------------------------------
 # The policy loader walks the compiled-in schema and only queries keys it finds
 # there. An unknown key is never read: no value, no error, no row at
 # brave://policy. Probing the shipped binary makes that visible rather than
@@ -525,7 +525,7 @@ function Initialize-SupportedKeys {
         return
     }
     # Any real Brave binary contains at least TorDisabled. Zero matches means
-    # the probe failed, not that Brave supports nothing — do not act on it.
+    # the probe failed, not that Brave supports nothing - do not act on it.
     if (@($hits).Count -eq 0) {
         Write-Warn 'Capability probe returned nothing; treating build support as unknown.'
         $script:SupportedKeys = @($script:ProbeUnavailable)
@@ -542,11 +542,11 @@ function Test-KeySupported {
     return ($script:SupportedKeys -contains $Key)
 }
 
-# ── JSON text editing ────────────────────────────────────────────────────────
+# -- JSON text editing --------------------------------------------------------
 # Preferences and Local State are edited as TEXT, not by parsing to objects and
 # writing them back. Windows PowerShell 5.1's ConvertFrom-Json collapses every
 # JSON number to Int32/Int64/Double, so a round trip rewrites 2.0 as 2 and
-# Chromium then discards the pref as the wrong type — silent data loss in a
+# Chromium then discards the pref as the wrong type - silent data loss in a
 # file this tool promises to leave otherwise untouched.
 #
 # So a scanner walks the raw text, finds the exact span of the value on a
@@ -716,7 +716,7 @@ function Set-JsonPrefText {
 
 function Remove-JsonPrefText {
     # Removes the member at the dotted path, then any container the removal
-    # left empty — the same tidy-up origin.sh's unset_path does.
+    # left empty - the same tidy-up origin.sh's unset_path does.
     param([string]$Text, [string]$Name)
     $parts = @($Name.Split('.'))
     $result = $Text
@@ -759,7 +759,7 @@ function Read-JsonFileText {
         throw 'starts with a UTF-8 BOM, which Chromium does not write'
     }
     # throwOnInvalidBytes: the permissive decoder turns a bad byte into U+FFFD,
-    # and the rewrite would then persist that replacement — corrupting a file
+    # and the rewrite would then persist that replacement - corrupting a file
     # this tool promises to leave byte-identical outside the span it edits.
     return (New-Object System.Text.UTF8Encoding($false, $true)).GetString($bytes)
 }
@@ -795,7 +795,7 @@ function Write-FileAtomic {
     }
 }
 
-# ── Receipt ──────────────────────────────────────────────────────────────────
+# -- Receipt ------------------------------------------------------------------
 # The schema every reader and writer agrees on. A receipt that parses but has
 # no policies_prior is worse than no receipt at all: deactivate would find
 # nothing to restore, count no failures, and then delete the file.
@@ -889,7 +889,7 @@ function Get-ReceiptDirForHive {
 
 function Get-ReceiptPath {
     # <channel>.<hive>.json. The hive is in the name because one channel can be
-    # activated in both, and a single receipt can only describe one of them —
+    # activated in both, and a single receipt can only describe one of them -
     # the other would be left enforcing policy with nothing able to roll it back.
     param([string]$ChannelId, [string]$Hive)
     return (Join-Path (Get-ReceiptDirForHive -Hive $Hive) ("{0}.{1}.json" -f $ChannelId, $Hive.ToLower()))
@@ -931,7 +931,7 @@ function Write-JsonRecord {
     Write-FileAtomic -Path $Path -Text (($Object | ConvertTo-Json -Depth 10) + "`r`n")
 }
 
-# ── Priors ───────────────────────────────────────────────────────────────────
+# -- Priors -------------------------------------------------------------------
 
 function Get-PolicyPriors {
     # Every prior value read, with its registry type, BEFORE the first write.
@@ -1041,7 +1041,7 @@ function Remove-PolicyKeyIfEmpty {
     }
 }
 
-# ── Channel selection ────────────────────────────────────────────────────────
+# -- Channel selection --------------------------------------------------------
 
 function Test-ChannelHasReceipt {
     param([string]$ChannelId)
@@ -1084,7 +1084,7 @@ if ($Channel) {
     }
     if ($null -eq $script:Target -and $Command -ne 'activate') {
         # Nothing installed to default to, so default to what there is a
-        # receipt for — that state is what deactivate and status exist to reach.
+        # receipt for - that state is what deactivate and status exist to reach.
         foreach ($channelInfo in $script:Channels) {
             if ($null -eq $script:Target -and (Test-ChannelHasReceipt -ChannelId $channelInfo.Id)) { $script:Target = $channelInfo }
         }
@@ -1136,7 +1136,7 @@ function Get-PrefLiteral {
     return 'false'
 }
 
-# ── Pref reading and writing ─────────────────────────────────────────────────
+# -- Pref reading and writing -------------------------------------------------
 
 function Read-PrefPriors {
     # One record per pref for one file. Returns @{ Records; Error }: Error set
@@ -1145,7 +1145,7 @@ function Read-PrefPriors {
     #
     # Nothing in here prints. A PowerShell function returns EVERY uncaptured
     # value, so a Write-Output beside a `return` hands the caller the printed
-    # lines as well — the caller reports, these compute.
+    # lines as well - the caller reports, these compute.
     param([string]$Path, $Prefs)
     try {
         $text = Read-JsonFileText -Path $Path
@@ -1183,7 +1183,7 @@ function Set-PrefFile {
     foreach ($pref in $Prefs) {
         # Guarded like every other call site. This one runs after the receipt is
         # written and the registry already mutated, and a file truncated between
-        # the capture read and this one throws out of the scanner — which would
+        # the capture read and this one throws out of the scanner - which would
         # abort activate rather than count one more pref file as failed.
         $record = $null
         try {
@@ -1266,7 +1266,7 @@ function Restore-PrefFile {
         }
         $restored++
     }
-    # Nothing was spliced — every record was already as recorded, or every one
+    # Nothing was spliced - every record was already as recorded, or every one
     # failed. Rewriting the file byte-for-byte gains nothing and can only lose.
     if ($text -ne $original) {
         try {
@@ -1293,7 +1293,7 @@ function Get-PrefCurrentValue {
     return [string]$record['value']
 }
 
-# ── ACTIVATE ─────────────────────────────────────────────────────────────────
+# -- ACTIVATE -----------------------------------------------------------------
 # The order here is the design: read every prior value, write the receipt, and
 # only then touch anything. Mutating first means an abort before the receipt is
 # written leaves the machine changed with no record of what it had been.
@@ -1313,17 +1313,17 @@ function Invoke-ActivateDryRun {
     Write-Section 'Crash / metrics reporting (Local State)'
     Write-Skip ("would update {0}" -f $script:LocalStatePath)
     Write-Section 'Result'
-    Write-Output '  Dry run — no changes made.'
+    Write-Output '  Dry run - no changes made.'
 }
 
 function Invoke-Activate {
-    Write-Section 'Brave Origin — activating'
+    Write-Section 'Brave Origin - activating'
     Write-Info ("Target : {0} ({1}) {2}" -f $script:Target.Name, $script:Target.Id, (Get-BraveVersion -ChannelInfo $script:Target -Install $script:TargetInstall))
     Write-Info ("Policy : {0}  [{1} scope]" -f $script:PolicyKeyPath, $script:Scope)
     Write-Info ("Profile: {0}" -f $script:UserDataDir)
 
     if ($DryRun) {
-        Write-Warn 'Dry run — nothing will be written.'
+        Write-Warn 'Dry run - nothing will be written.'
         Initialize-SupportedKeys -Install $script:TargetInstall
         Invoke-ActivateDryRun
         return
@@ -1333,7 +1333,7 @@ function Invoke-Activate {
     Assert-BraveClosed
     Initialize-SupportedKeys -Install $script:TargetInstall
 
-    # ── Capture ──────────────────────────────────────────────────────────────
+    # -- Capture --------------------------------------------------------------
     # Nothing below this heading writes; nothing above the receipt does either.
     Write-Section 'Reading current values'
     $captured = Get-PolicyPriors -KeyPath $script:PolicyKeyPath
@@ -1380,10 +1380,10 @@ function Invoke-Activate {
     $localStateNote = if ($localStateCaptured) { 'Local State' } else { 'Local State NOT read' }
     Write-Ok ("{0} policy value(s), {1} profile pref file(s), {2}" -f $script:Policies.Count, $capturedFiles.Count, $localStateNote)
 
-    # ── Refcount, then receipt, then the first write ─────────────────────────
+    # -- Refcount, then receipt, then the first write -------------------------
     # The refcount holds the EARLIEST prior across every channel. When it
     # already exists, its copy is the untouched machine and this run's freshly
-    # read values are our own writing — so it wins.
+    # read values are our own writing - so it wins.
     $refcount = $null
     try {
         $refcount = Read-JsonRecord -Path $script:RefcountPath
@@ -1463,7 +1463,7 @@ function Invoke-Activate {
     Write-Info ("Receipt written before any change: {0}" -f $script:ReceiptPath)
 
     # The refcount records the same prior, and it too must be written before
-    # the values it protects are overwritten — afterwards, the "prior" would be
+    # the values it protects are overwritten - afterwards, the "prior" would be
     # our own writing. It comes second so that a failed receipt write cannot
     # leave this channel listed here with nothing able to release it.
     $refcountRecord = [ordered]@{
@@ -1478,7 +1478,7 @@ function Invoke-Activate {
         Stop-WithError ("Could not record the policy-key state at {0}; nothing was written. ({1})" -f $script:RefcountPath, $_.Exception.Message)
     }
 
-    # ── Mutate ───────────────────────────────────────────────────────────────
+    # -- Mutate ---------------------------------------------------------------
     $applied = 0; $inert = 0; $failed = 0
     Write-Section 'Brave Origin policies'
     foreach ($policy in $script:Policies) {
@@ -1488,7 +1488,7 @@ function Invoke-Activate {
             $inert++
         }
         if ($refused.ContainsKey($policy.Key)) {
-            Write-Fail ("{0} — left untouched: {1}, which cannot be restored exactly" -f $policy.Key, $refused[$policy.Key])
+            Write-Fail ("{0} - left untouched: {1}, which cannot be restored exactly" -f $policy.Key, $refused[$policy.Key])
             $failed++
             continue
         }
@@ -1496,7 +1496,7 @@ function Invoke-Activate {
         try {
             Set-PolicyValueRaw -KeyPath $script:PolicyKeyPath -Name $policy.Key -Value $want -Type 'DWord'
         } catch {
-            Write-Fail ("{0} — write failed: {1}" -f $policy.Key, $_.Exception.Message)
+            Write-Fail ("{0} - write failed: {1}" -f $policy.Key, $_.Exception.Message)
             $failed++
             continue
         }
@@ -1505,7 +1505,7 @@ function Invoke-Activate {
             Write-Ok ("{0} = {1} {2}({3}){4}{5}" -f $policy.Key, $policy.Value.ToString().ToLower(), $script:Dim, $policy.Settable, $script:Reset, $note)
             $applied++
         } else {
-            Write-Fail ("{0} — write did NOT take effect" -f $policy.Key)
+            Write-Fail ("{0} - write did NOT take effect" -f $policy.Key)
             $failed++
         }
     }
@@ -1538,7 +1538,7 @@ function Invoke-Activate {
     # Brave may have been launched while we were writing; its in-memory copy
     # would overwrite the JSON edits on exit.
     if ($null -ne $script:TargetInstall -and (Test-BraveRunning -ExePath $script:TargetInstall.Exe)) {
-        Write-Warn ("{0} started during this run — re-run activate after quitting it." -f $script:Target.Name)
+        Write-Warn ("{0} started during this run - re-run activate after quitting it." -f $script:Target.Name)
     }
 
     Write-Section 'Result'
@@ -1556,15 +1556,15 @@ function Invoke-Activate {
         $script:ExitCode = 1
         return
     }
-    Write-Output ("  {0}Restart {1}{2} — all policies are dynamic_refresh:false." -f $script:Bold, $script:Target.Name, $script:Reset)
+    Write-Output ("  {0}Restart {1}{2} - all policies are dynamic_refresh:false." -f $script:Bold, $script:Target.Name, $script:Reset)
     Write-Output ("  {0}gpupdate /force shortens the <=15-minute policy reload, but the restart is still required.{1}" -f $script:Dim, $script:Reset)
     Write-Output '  Verify at brave://policy'
 }
 
-# ── DEACTIVATE ───────────────────────────────────────────────────────────────
+# -- DEACTIVATE ---------------------------------------------------------------
 
 function Invoke-Deactivate {
-    Write-Section 'Brave Origin — deactivating'
+    Write-Section 'Brave Origin - deactivating'
     Write-Info ("Target : {0} ({1})" -f $script:Target.Name, $script:Target.Id)
 
     # Before the receipt check, not after: %ProgramData%\brave-to-origin is
@@ -1599,7 +1599,7 @@ function Invoke-Deactivate {
     if (-not $DryRun) {
         Assert-BraveClosed
     } else {
-        Write-Warn 'Dry run — nothing will be written.'
+        Write-Warn 'Dry run - nothing will be written.'
     }
 
     Write-Info ("Receipt: {0}" -f $script:ReceiptPath)
@@ -1644,11 +1644,11 @@ function Invoke-Deactivate {
         $remaining = @($channels | Where-Object { $_ -ne $script:Target.Id })
         if ($remaining.Count -gt 0) {
             $release = $false
-            $outcome = ("left in place — still active for {0}" -f ($remaining -join ', '))
+            $outcome = ("left in place - still active for {0}" -f ($remaining -join ', '))
             if ($DryRun) {
                 Write-Skip ("would leave {0}: {1} still active" -f $script:PolicyKeyPath, ($remaining -join ', '))
             } else {
-                Write-Info ("{0} still active — leaving {1} in place." -f ($remaining -join ', '), $script:PolicyKeyPath)
+                Write-Info ("{0} still active - leaving {1} in place." -f ($remaining -join ', '), $script:PolicyKeyPath)
                 $updated = [ordered]@{
                     policy_key = $script:PolicyKeyPath
                     prior      = (ConvertTo-PriorTable -JsonObject $recorded)
@@ -1669,7 +1669,7 @@ function Invoke-Deactivate {
     } else {
         # The refcount is the handle, and it is gone. The receipt carries its
         # own copy of the prior, so a lost record no longer means a lost prior
-        # — but it does mean no other channel's claim can be seen from here.
+        # - but it does mean no other channel's claim can be seen from here.
         Write-Warn ("No policy-key record at {0}. Restoring from this receipt's own copy of the priors; another channel may still want these values." -f $script:RefcountPath)
         $priorSource = ConvertTo-PriorTable -JsonObject (Get-Prop -Object $receipt -Name 'policies_prior')
     }
@@ -1679,7 +1679,7 @@ function Invoke-Deactivate {
             if (-not $priorSource.Contains($policy.Key)) {
                 # No prior recorded means activate refused to touch it, so
                 # there is nothing of ours here to take back.
-                Write-Skip ("{0} — not recorded by activate, left as it is" -f $policy.Key)
+                Write-Skip ("{0} - not recorded by activate, left as it is" -f $policy.Key)
                 continue
             }
             $prior = $priorSource[$policy.Key]
@@ -1717,7 +1717,7 @@ function Invoke-Deactivate {
             } else {
                 # No substitute value gets written here: putting a REG_BINARY
                 # back as a DWord destroys it, and reporting success hides that.
-                Write-Fail ("{0} — recorded prior is a {1}; refusing to substitute a value. Left as it is." -f $policy.Key, $type)
+                Write-Fail ("{0} - recorded prior is a {1}; refusing to substitute a value. Left as it is." -f $policy.Key, $type)
                 $policyFailed++
             }
         }
@@ -1726,7 +1726,7 @@ function Invoke-Deactivate {
             $subKeys = @(Get-PolicySubKeyNames -KeyPath $script:PolicyKeyPath)
             $reserved = @($subKeys | Where-Object { $script:ReservedSubKeys -contains $_ })
             if ($subKeys.Count -gt 0) {
-                Write-Info ("Policy key kept: it still holds subkey(s) {0}{1}" -f ($subKeys -join ', '), $(if ($reserved.Count -gt 0) { ' — reserved, never touched here' } else { '' }))
+                Write-Info ("Policy key kept: it still holds subkey(s) {0}{1}" -f ($subKeys -join ', '), $(if ($reserved.Count -gt 0) { ' - reserved, never touched here' } else { '' }))
             } elseif (Remove-PolicyKeyIfEmpty -KeyPath $script:PolicyKeyPath) {
                 Write-Ok ("policy key removed (no values or subkeys left): {0}" -f $script:PolicyKeyPath)
             }
@@ -1773,13 +1773,13 @@ function Invoke-Deactivate {
         Write-Output ("  Policy key       : {0}" -f $outcome)
     }
     if ($policyFailed -gt 0 -or $script:PrefRestoreFailures -gt 0) {
-        Write-Output ("  {0}Failures{1}         : {2} polic(y/ies), {3} pref file(s) — receipt kept" -f $script:Red, $script:Reset, $policyFailed, $script:PrefRestoreFailures)
+        Write-Output ("  {0}Failures{1}         : {2} polic(y/ies), {3} pref file(s) - receipt kept" -f $script:Red, $script:Reset, $policyFailed, $script:PrefRestoreFailures)
     }
     Write-Output ("  {0}Restart {1}.{2}" -f $script:Bold, $script:Target.Name, $script:Reset)
     if ($policyFailed -gt 0 -or $script:PrefRestoreFailures -gt 0) { $script:ExitCode = 1 }
 }
 
-# ── STATUS ───────────────────────────────────────────────────────────────────
+# -- STATUS -------------------------------------------------------------------
 
 function Get-PolicyDisplay {
     # What one hive holds for one value, rendered for the table.
@@ -1793,7 +1793,7 @@ function Get-PolicyDisplay {
 }
 
 function Invoke-Status {
-    Write-Section 'Brave Origin — status'
+    Write-Section 'Brave Origin - status'
     $version = Get-BraveVersion -ChannelInfo $script:Target -Install $script:TargetInstall
     Write-Info ("Target : {0} ({1}) {2}" -f $script:Target.Name, $script:Target.Id, $version)
     if ($version -ne $script:ValidatedAgainst) {
@@ -1822,20 +1822,20 @@ function Invoke-Status {
             if ($hive -ne $script:Hive.ToLower()) { $otherScopeReceipt = $path }
             $record = Read-JsonRecord -Path $path
             $state = [string](Get-Prop -Object $record -Name 'state')
-            Write-Info ("Receipt: {0} {1}({2} scope · {3}){4}" -f $path, $script:Dim, [string](Get-Prop -Object $record -Name 'scope'), $state, $script:Reset)
+            Write-Info ("Receipt: {0} {1}({2} scope - {3}){4}" -f $path, $script:Dim, [string](Get-Prop -Object $record -Name 'scope'), $state, $script:Reset)
         } catch {
-            Write-Fail ("Receipt: {0} — unreadable ({1})" -f $path, $_.Exception.Message)
+            Write-Fail ("Receipt: {0} - unreadable ({1})" -f $path, $_.Exception.Message)
         }
     }
     if ($otherScopeReceipt) {
         $otherFlag = if ($User) { 'without -User' } else { 'with -User' }
-        Write-Warn ("The other scope is still active: {0} — re-run deactivate {1} to roll it back." -f $otherScopeReceipt, $otherFlag)
+        Write-Warn ("The other scope is still active: {0} - re-run deactivate {1} to roll it back." -f $otherScopeReceipt, $otherFlag)
     }
     if (-not $foundReceipt) {
         if (-not $User -and -not (Test-Elevated)) {
             Write-Warn ("Receipts under {0} are readable by administrators only; re-run elevated to see them." -f $script:ReceiptDirMachine)
         } else {
-            Write-Warn 'No receipt — deactivate will refuse to run until activate creates one.'
+            Write-Warn 'No receipt - deactivate will refuse to run until activate creates one.'
         }
     }
     if (-not $User) {
@@ -1845,7 +1845,7 @@ function Invoke-Status {
         Write-Warn ("Per-user scope checked for {0} only; another account's HKCU receipt lives in their own profile and could not be checked." -f $env:USERNAME)
     }
 
-    Write-Section ("Policies — {0} {1}(shared by every channel; HKLM wins over HKCU){2}" -f $script:PolicyKeyPath, $script:Dim, $script:Reset)
+    Write-Section ("Policies - {0} {1}(shared by every channel; HKLM wins over HKCU){2}" -f $script:PolicyKeyPath, $script:Dim, $script:Reset)
     try {
         $refcount = Read-JsonRecord -Path $script:RefcountPath
         if ($null -ne $refcount) {
@@ -1875,13 +1875,13 @@ function Invoke-Status {
         }
         Write-Output ("  {0}{1,-30} {2,-6} {3,-9} {4,-9} {5}{6}" -f $colour, $policy.Key, $want, $machine, $user, $effect, $script:Reset)
     }
-    Write-Output ("  {0}enforced {1} · not applied {2} · inert {3}{4}" -f $script:Dim, $active, $missing, $inert, $script:Reset)
+    Write-Output ("  {0}enforced {1} - not applied {2} - inert {3}{4}" -f $script:Dim, $active, $missing, $inert, $script:Reset)
 
     foreach ($keyPath in @($script:PolicyKeyPathMachine, $script:PolicyKeyPathUser)) {
         $subKeys = @(Get-PolicySubKeyNames -KeyPath $keyPath)
         $reserved = @($subKeys | Where-Object { $script:ReservedSubKeys -contains $_ })
         if ($reserved.Count -gt 0) {
-            Write-Info ("{0} holds {1} {2}(reserved — never written or removed here){3}" -f $keyPath, ($reserved -join ', '), $script:Dim, $script:Reset)
+            Write-Info ("{0} holds {1} {2}(reserved - never written or removed here){3}" -f $keyPath, ($reserved -join ', '), $script:Dim, $script:Reset)
         }
     }
 

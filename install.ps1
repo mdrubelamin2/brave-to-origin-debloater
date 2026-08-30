@@ -1,12 +1,12 @@
 # =============================================================================
-# Brave to Origin — one-shot installer for Windows
+# Brave to Origin - one-shot installer for Windows
 # =============================================================================
 #
 #   irm https://raw.githubusercontent.com/mdrubelamin2/brave-to-origin/main/install.ps1 | iex
 #
 # Fetches origin.ps1 at a pinned tag, verifies its SHA-256, parses it, and runs
 # it. Nothing is left behind: the script goes to a temp file and is deleted
-# after. The receipt it writes lives outside all of this — %ProgramData% —
+# after. The receipt it writes lives outside all of this - %ProgramData% -
 # so a later deactivate needs none of it.
 #
 # Non-interactive form, for scripts and CI. `iex` cannot take arguments, so the
@@ -41,8 +41,8 @@ $ErrorActionPreference = 'Stop'
 $Repo = 'mdrubelamin2/brave-to-origin'
 # Pinned, not a moving branch: piping a URL to an elevated shell should not
 # mean "whatever that branch says today". Bump both together at a release.
-$PinnedRef = 'v1.2.2'
-$PinnedSha256 = '1a2f3e2c46108197810aaf7d8aefcb2dc3e371ce474d3f2fa917d5f99c4590e3'
+$PinnedRef = 'v1.2.3'
+$PinnedSha256 = 'b07335a742d3e850fd6125895aab92daa4c192a1840aa163ade0b85794bf0b3e'
 
 $Ref = if ($env:ORIGIN_REF) { $env:ORIGIN_REF } else { $PinnedRef }
 $ExpectedSha = if ($env:ORIGIN_SHA256) { $env:ORIGIN_SHA256 } else { $PinnedSha256 }
@@ -82,7 +82,7 @@ function Stop-WithError {
     Complete-Run 1
 }
 
-# Validated here rather than with [ValidateSet] on the parameter — see the note
+# Validated here rather than with [ValidateSet] on the parameter - see the note
 # above the param block for why that attribute cannot survive `iex`.
 $ValidActions = @('activate', 'deactivate', 'status')
 if ($Action -and $ValidActions -notcontains $Action) {
@@ -94,7 +94,7 @@ if ($Action -and $ValidActions -notcontains $Action) {
 $IrmCommand = "irm https://raw.githubusercontent.com/$Repo/$Ref/install.ps1 | iex"
 $ArgCommand = "& ([scriptblock]::Create((irm https://raw.githubusercontent.com/$Repo/$Ref/install.ps1)))"
 
-# ── Guards ───────────────────────────────────────────────────────────────────
+# -- Guards -------------------------------------------------------------------
 # The registry policy store is a Windows thing. macOS and Linux keep theirs in
 # files, which install.sh and origin.sh handle.
 $IsWindowsHost = ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT)
@@ -103,7 +103,7 @@ if (-not $IsWindowsHost) {
 }
 
 # TLS 1.2 explicitly: Windows PowerShell 5.1 defaults to SSL3/TLS1.0 on stock
-# Windows 10, and raw.githubusercontent.com has refused those for years — the
+# Windows 10, and raw.githubusercontent.com has refused those for years - the
 # failure is an opaque "underlying connection was closed".
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -118,10 +118,10 @@ function Test-Elevated {
 }
 
 Write-Output ''
-Write-Output ("{0}Brave to Origin{1} {2}— {3} @ {4}{5}" -f $Bold, $Reset, $Dim, $Repo, $Ref, $Reset)
+Write-Output ("{0}Brave to Origin{1} {2}- {3} @ {4}{5}" -f $Bold, $Reset, $Dim, $Repo, $Ref, $Reset)
 Write-Output ''
 
-# ── Which Brave is installed ─────────────────────────────────────────────────
+# -- Which Brave is installed -------------------------------------------------
 # Kept in step with origin.ps1's own table. Order matters: the first match is
 # the default.
 $Channels = @(
@@ -197,8 +197,8 @@ if ($Found.Count -eq 0) {
 }
 Write-Output ''
 
-# ── Choose action and channel ────────────────────────────────────────────────
-# Arguments win. Otherwise ask — and unlike the bash installer there is no
+# -- Choose action and channel ------------------------------------------------
+# Arguments win. Otherwise ask - and unlike the bash installer there is no
 # consumed-stdin problem, because `iex` runs the text rather than piping it
 # into the shell's own input.
 function Read-Choice {
@@ -224,8 +224,8 @@ if (-not $Action) {
     Write-Output ''
 }
 
-# Only activate needs a browser. A receipt outlives the install it describes —
-# origin.ps1 acts on one for an uninstalled channel on purpose — so refusing
+# Only activate needs a browser. A receipt outlives the install it describes -
+# origin.ps1 acts on one for an uninstalled channel on purpose - so refusing
 # deactivate here would mean "reinstall Brave before you may roll policy back".
 if ($Found.Count -eq 0) {
     if ($Action -eq 'activate') {
@@ -263,7 +263,7 @@ if ($Action -ne 'status' -and -not $User -and -not $DryRun -and -not (Test-Eleva
     Stop-WithError -KeepOpen -Message ("Writing HKLM\SOFTWARE\Policies\BraveSoftware\Brave needs an elevated session.`r`n    Close this window, start Windows Terminal or PowerShell with 'Run as`r`n    administrator', and re-run:`r`n      {0} -Action {1}{2}`r`n    Or write your own user's policy key instead, which needs no elevation:`r`n      {0} -Action {1}{2} -User" -f $ArgCommand, $Action, $ChannelArg)
 }
 
-# ── Fetch and verify ─────────────────────────────────────────────────────────
+# -- Fetch and verify ---------------------------------------------------------
 $TempDir = Join-Path ([System.IO.Path]::GetTempPath()) ('brave-to-origin-' + [guid]::NewGuid().ToString('N'))
 New-Item -Path $TempDir -ItemType Directory -Force | Out-Null
 $ScriptPath = Join-Path $TempDir 'origin.ps1'
@@ -288,8 +288,8 @@ try {
     }
 
     $ActualSha = (Get-FileHash -LiteralPath $ScriptPath -Algorithm SHA256).Hash.ToLower()
-    # Fails closed. Anything that is not 64 hex characters is not a checksum —
-    # an unreplaced placeholder, an empty value, a truncated one — and running
+    # Fails closed. Anything that is not 64 hex characters is not a checksum -
+    # an unreplaced placeholder, an empty value, a truncated one - and running
     # unverified code fetched over the network because the release forgot to
     # substitute a variable is the bug the bash installer already shipped once.
     # Only a human typing ORIGIN_SHA256=skip may downgrade it to a warning.
@@ -297,9 +297,9 @@ try {
         Write-Warn 'Checksum verification skipped: ORIGIN_SHA256=skip.'
         Write-Warn ("SHA-256 is {0}" -f $ActualSha)
     } elseif ($ExpectedSha -notmatch '^[0-9a-f]{64}$') {
-        Stop-WithError ("Refusing to run unverified code.`r`n    The pinned checksum reads '{0}', which is not a 64-character SHA-256 — this`r`n    copy of install.ps1 was published without a checksum substituted into it.`r`n    The downloaded file hashes to {1}, but nothing here can say that is right.`r`n    Clone the repository and run origin.ps1 directly instead:`r`n      git clone https://github.com/{2}.git`r`n      .\brave-to-origin\origin.ps1 {3}" -f $ExpectedSha, $ActualSha, $Repo, $Action)
+        Stop-WithError ("Refusing to run unverified code.`r`n    The pinned checksum reads '{0}', which is not a 64-character SHA-256 - this`r`n    copy of install.ps1 was published without a checksum substituted into it.`r`n    The downloaded file hashes to {1}, but nothing here can say that is right.`r`n    Clone the repository and run origin.ps1 directly instead:`r`n      git clone https://github.com/{2}.git`r`n      .\brave-to-origin\origin.ps1 {3}" -f $ExpectedSha, $ActualSha, $Repo, $Action)
     } elseif ($ActualSha -ne $ExpectedSha.ToLower()) {
-        Stop-WithError ("Checksum mismatch — refusing to run.`r`n    expected {0}`r`n    got      {1}`r`n    Either the release moved or the download was tampered with." -f $ExpectedSha.ToLower(), $ActualSha)
+        Stop-WithError ("Checksum mismatch - refusing to run.`r`n    expected {0}`r`n    got      {1}`r`n    Either the release moved or the download was tampered with." -f $ExpectedSha.ToLower(), $ActualSha)
     } else {
         Write-Ok 'Checksum verified'
     }
@@ -314,10 +314,10 @@ try {
         Stop-WithError ("Downloaded script does not parse: {0}" -f $parseErrors[0].Message)
     }
 
-    # ── Run it ───────────────────────────────────────────────────────────────
+    # -- Run it ---------------------------------------------------------------
     Write-Output ''
-    # Tell origin.ps1 how the user invoked it, so anything it prints back — the
-    # rollback command especially — is a command they can actually paste.
+    # Tell origin.ps1 how the user invoked it, so anything it prints back - the
+    # rollback command especially - is a command they can actually paste.
     $env:ORIGIN_INVOCATION = $ArgCommand
     $cliArgs = @($Action)
     if ($Channel) { $cliArgs += @('-Channel', $Channel) }
@@ -326,7 +326,7 @@ try {
     if ($NoColor) { $cliArgs += '-NoColor' }
     # Out of process with an explicit bypass. `irm | iex` is exempt from the
     # execution policy because nothing is loaded from a file, but Restricted is
-    # the shipping default on client Windows and it refuses a script FILE — so
+    # the shipping default on client Windows and it refuses a script FILE - so
     # dot-sourcing the temp copy dies with "running scripts is disabled on this
     # system" after the elevation prompt, the download and the hash check.
     # -File also makes $LASTEXITCODE origin.ps1's own exit code, not the last

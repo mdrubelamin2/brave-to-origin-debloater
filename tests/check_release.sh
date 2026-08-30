@@ -53,7 +53,25 @@ else
   echo "    (pass a tag to check the pinned refs too)"
 fi
 
-# 5. Every suite green.
+# 5. PSScriptAnalyzer's own 5.1 checks, when it is available. This is what
+#    caught the missing-BOM/non-ASCII problem that the hand-written lint did
+#    not know to look for.
+if command -v pwsh >/dev/null 2>&1 && \
+   pwsh -NoProfile -Command 'if (Get-Module -ListAvailable PSScriptAnalyzer) { exit 0 } else { exit 1 }' 2>/dev/null; then
+  out=$(pwsh -NoProfile -Command '
+    $s = @{ Rules = @{ PSUseCompatibleSyntax = @{ Enable = $true; TargetVersions = @("5.1","7.0") } } }
+    $bad = @()
+    foreach ($f in @("origin.ps1","install.ps1")) {
+      $bad += Invoke-ScriptAnalyzer -Path $f -Settings $s |
+        Where-Object { $_.RuleName -eq "PSUseCompatibleSyntax" -or $_.Message -like "*BOM*" }
+    }
+    if ($bad) { $bad | ForEach-Object { Write-Output $_.Message }; exit 1 }' 2>&1)
+  if [[ -n "$out" ]]; then bad "PSScriptAnalyzer 5.1: $out"; else good "PSScriptAnalyzer 5.1 checks clean"; fi
+else
+  echo "    (PSScriptAnalyzer not installed - 5.1 rule check skipped)"
+fi
+
+# 6. Every suite green.
 bash tests/run_tests.sh >/dev/null 2>&1 && good "bash suite passes" || bad "bash suite fails"
 if command -v pwsh >/dev/null 2>&1; then
   pwsh -NoProfile -File tests/Run-Tests.ps1 >/dev/null 2>&1 && good "PowerShell suite passes" || bad "PowerShell suite fails"
