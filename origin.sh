@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Brave Origin — policy clone for standard Brave on macOS
+# Brave Origin — policy clone for standard Brave on macOS and Linux
 # =============================================================================
 #
 # Applies the 16 preferences that Brave Origin "upgrade mode" enforces, using
@@ -10,9 +10,17 @@
 # Every policy key, pref name and default was verified against brave-core.
 # See README.md for the file-by-file citations.
 #
+# THE TWO POLICY BACKENDS
+#   macOS reads a managed-preferences plist per bundle ID, which is a shared
+#   domain an MDM also writes, so every prior value there is captured with its
+#   type and restored exactly. Linux reads every *.json under
+#   /etc/brave/policies/managed/, so this writes one file of its own and can
+#   put the directory back byte-for-byte. That directory is global, not
+#   per-channel, so a refcount records which channels are relying on it.
+#
 # PROVENANCE
 #   `activate` records what it changed, and each key's prior value, in a
-#   receipt under /Library/Application Support/brave-origin-clone/.
+#   receipt under the platform's receipt directory.
 #   `deactivate` acts only on that receipt: it removes keys it added and
 #   restores keys it overwrote. Without a receipt it will not guess, because
 #   these policy keys are also what an MDM profile or another debloat script
@@ -32,7 +40,7 @@
 #   sudo ./origin.sh activate|deactivate|status [--machine] [--channel <id>]
 #                                               [--dry-run] [--no-color]
 #
-# Requires: python3 (Command Line Tools). Verify results at brave://policy.
+# Requires: python3 (macOS: Command Line Tools). Verify results at brave://policy.
 # Restart Brave afterwards — every policy is dynamic_refresh:false.
 # =============================================================================
 
@@ -41,6 +49,18 @@ set -euo pipefail
 if [[ -z "${BASH_VERSINFO:-}" ]]; then
   echo "This script requires bash." >&2; exit 1
 fi
+
+# ── Platform ─────────────────────────────────────────────────────────────────
+# The single input to every platform split below, on one line, so there is one
+# place to look and one place to override. Windows is absent on purpose: its
+# policy store is the registry, not a file this could write.
+PLATFORM="$(uname -s)"
+case "$PLATFORM" in
+  Darwin|macos) PLATFORM="macos" ;;
+  Linux|linux)  PLATFORM="linux" ;;
+  *) echo "Unsupported platform: $(uname -s). This supports macOS and Linux." >&2
+     exit 1 ;;
+esac
 
 # The policy set was last checked against this Brave version. `status` compares
 # it to what is installed so a stale set becomes visible rather than silent.
@@ -78,6 +98,15 @@ else
   RED=""; GREEN=""; YELLOW=""; CYAN=""; DIM=""; BOLD=""; RESET=""
 fi
 
+# root's group is `wheel` on macOS and `root` on Debian and Ubuntu, where a
+# `wheel` group need not exist at all. Never fatal: an unwritable owner on a
+# file we just created is not a reason to abandon the run.
+chown_root() {
+  local owner="root:wheel"
+  [[ "$PLATFORM" == "linux" ]] && owner="root:root"
+  chown "$owner" "$@" 2>/dev/null || true
+}
+
 info()    { echo "${CYAN}[*]${RESET} $*"; }
 ok()      { echo "${GREEN}[+]${RESET} $*"; }
 warn()    { echo "${YELLOW}[!]${RESET} $*"; }
@@ -96,8 +125,10 @@ ${BOLD}Usage:${RESET} ${SELF_CMD} <activate|deactivate|status> [options]
   status       Report what is applied, and what Brave will actually honour
 
 ${BOLD}Options:${RESET}
-  --machine        Machine-wide policy path (lower fidelity, not file-watched)
-  --channel <id>   Target bundle ID, e.g. com.brave.Browser.beta
+  --machine        macOS: machine-wide policy path (lower fidelity, not
+                   file-watched). Linux: accepted and ignored — policy there
+                   is always machine scope
+  --channel <id>   Target channel, e.g. com.brave.Browser.beta
   --dry-run        Show planned changes without writing
   --no-color       Suppress ANSI colour (also automatic when piped)
 
@@ -111,12 +142,21 @@ EOF
 # ── Preflight ────────────────────────────────────────────────────────────────
 # python3 does every JSON edit. Discovering it is missing halfway through
 # leaves policies applied and prefs untouched, so check before writing anything.
-command -v python3 >/dev/null 2>&1 || \
-  err "python3 not found. Install the Command Line Tools: xcode-select --install"
-[[ -x /usr/libexec/PlistBuddy ]] || err "/usr/libexec/PlistBuddy not found."
-# plutil carries the typed reads and writes, so a missing one is not a fallback
-# case: without it a prior value cannot be recorded faithfully at all.
-command -v plutil >/dev/null 2>&1 || err "plutil not found."
+if ! command -v python3 >/dev/null 2>&1; then
+  if [[ "$PLATFORM" == "macos" ]]; then
+    err "python3 not found. Install the Command Line Tools: xcode-select --install"
+  else
+    err "python3 not found. Install your distribution's python3 package."
+  fi
+fi
+# PlistBuddy and plutil carry the typed reads and writes of the macOS policy
+# plist, so a missing one is not a fallback case: without them a prior value
+# cannot be recorded faithfully at all. Neither exists — nor is needed — on
+# Linux, where the policy store is a JSON file this script owns outright.
+if [[ "$PLATFORM" == "macos" ]]; then
+  [[ -x /usr/libexec/PlistBuddy ]] || err "/usr/libexec/PlistBuddy not found."
+  command -v plutil >/dev/null 2>&1 || err "plutil not found."
+fi
 
 # ── Resolve the human user ───────────────────────────────────────────────────
 # Under sudo $HOME may be root's. The per-user managed-preferences directory and
@@ -138,6 +178,27 @@ TARGET_HOME=$(TU="$TARGET_USER" python3 -c \
 # write, chmod and chown an arbitrary file. Dropping privileges removes it.
 as_user() { sudo -u "$TARGET_USER" "$@"; }
 
+# ── Receipt location ─────────────────────────────────────────────────────────
+# Resolved before channel detection, not after, because a receipt outlives the
+# install it describes: `apt remove brave-browser-beta` must still leave beta's
+# entry in the shared Linux refcount releasable, and the checks below need to
+# know whether a receipt exists before they refuse to run.
+RECEIPT_DIR="/Library/Application Support/brave-origin-clone"
+LINUX_RECEIPT_DIR="/var/lib/brave-to-origin"
+if [[ "$PLATFORM" == "linux" ]]; then RECEIPT_DIR="$LINUX_RECEIPT_DIR"; fi
+
+# Both scoped names and the pre-split one, since deactivate honours all three.
+channel_has_receipt() {
+  local r
+  for r in "${RECEIPT_DIR}/${1}.user.json" "${RECEIPT_DIR}/${1}.machine.json" \
+           "${RECEIPT_DIR}/${1}.json"; do
+    [[ -f "$r" ]] && return 0
+  done
+  return 1
+}
+
+any_receipt() { compgen -G "${RECEIPT_DIR}/*.json" >/dev/null 2>&1; }
+
 # ── Channel detection ────────────────────────────────────────────────────────
 # Bundle IDs from brave-core app/theme/*/BRANDING. Brave is not built with
 # GOOGLE_CHROME_BRANDING, so unlike Chrome each channel reads its OWN bundle ID.
@@ -156,18 +217,102 @@ declare -a CH_DATA=(
   "Brave-Browser" "Brave-Browser-Beta" "Brave-Browser-Nightly"
   "Brave-Browser-Dev" "Brave-Origin"
 )
+# Identical to `basename "<app>" .app` for every macOS entry; a table because
+# Linux has no bundle to take a name from.
+declare -a CH_NAME=(
+  "Brave Browser" "Brave Browser Beta" "Brave Browser Nightly"
+  "Brave Browser Dev" "Brave Origin"
+)
+# Package names for the version lookup, and the install "kind", which decides
+# how an install is detected and where its profile lives. macOS has one of each.
+declare -a CH_PKG=("" "" "" "" "")
+declare -a CH_KIND=("app" "app" "app" "app" "app")
+
+# Linux ships no dev channel and no Origin standalone, and has no bundle IDs at
+# all — the IDs below are reused purely as channel names, so --channel, the
+# receipt filenames and install.sh read the same on both platforms.
+if [[ "$PLATFORM" == "linux" ]]; then
+  # Snap confines Brave with an AppArmor profile whose browser_support abstraction
+  # whitelists only /etc/opt/chrome and /etc/chromium. A policy file under
+  # /etc/brave is unreadable to it, so writing one would report success and
+  # change nothing at all.
+  SNAP_BRAVE="/snap/brave/current/opt/brave.com/brave/brave"
+  CH_APP=(
+    "/opt/brave.com/brave/brave"
+    "/opt/brave.com/brave-beta/brave"
+    "/opt/brave.com/brave-nightly/brave"
+  )
+  CH_ID=("com.brave.Browser" "com.brave.Browser.beta" "com.brave.Browser.nightly")
+  CH_DATA=("Brave-Browser" "Brave-Browser-Beta" "Brave-Browser-Nightly")
+  CH_NAME=("Brave" "Brave Beta" "Brave Nightly")
+  CH_PKG=("brave-browser" "brave-browser-beta" "brave-browser-nightly")
+  CH_KIND=("elf" "elf" "elf")
+
+  # Flatpak's manifest grants --filesystem=host-etc and its brave.sh symlinks
+  # the host's managed policies in at launch, so /etc/brave works there — but
+  # the profile is inside the sandbox's own $XDG_CONFIG_HOME.
+  FLATPAK_ID="com.brave.Browser"
+  for fp in "/var/lib/flatpak/app/${FLATPAK_ID}" \
+            "${TARGET_HOME}/.local/share/flatpak/app/${FLATPAK_ID}"; do
+    [[ -d "$fp" ]] || continue
+    CH_APP+=("$fp"); CH_ID+=("com.brave.Browser.flatpak")
+    CH_DATA+=("Brave-Browser"); CH_NAME+=("Brave (Flatpak)")
+    CH_PKG+=(""); CH_KIND+=("flatpak")
+    break
+  done
+fi
+
+# Where each channel keeps its profiles. macOS puts them under Application
+# Support; Linux uses XDG config with NO "User Data" component — profiles and
+# Local State sit directly in that directory.
+declare -a CH_PROFILE=()
+if [[ "$PLATFORM" == "macos" ]]; then
+  for d in "${CH_DATA[@]}"; do
+    CH_PROFILE+=("${TARGET_HOME}/Library/Application Support/BraveSoftware/${d}")
+  done
+else
+  XDG_CONFIG="${XDG_CONFIG_HOME:-${TARGET_HOME}/.config}"
+  for i in "${!CH_DATA[@]}"; do
+    if [[ "${CH_KIND[$i]}" == "flatpak" ]]; then
+      CH_PROFILE+=("${TARGET_HOME}/.var/app/${FLATPAK_ID}/config/BraveSoftware/${CH_DATA[$i]}")
+    else
+      CH_PROFILE+=("${XDG_CONFIG}/BraveSoftware/${CH_DATA[$i]}")
+    fi
+  done
+fi
 
 APP_PATH=""; BUNDLE_ID=""; DATA_DIR=""; CHANNEL_NAME=""
+PKG_NAME=""; CHANNEL_KIND=""; USER_DATA=""
+# A .app is a directory; a Linux install is an ELF or a Flatpak app directory.
+channel_installed() {
+  if [[ "$PLATFORM" == "macos" ]]; then [[ -d "$1" ]]; else [[ -e "$1" ]]; fi
+}
 declare -a FOUND_IDX=()
 for i in "${!CH_APP[@]}"; do
-  [[ -d "${CH_APP[$i]}" ]] && FOUND_IDX+=("$i")
+  channel_installed "${CH_APP[$i]}" && FOUND_IDX+=("$i")
 done
-[[ ${#FOUND_IDX[@]} -eq 0 ]] && err "No Brave install found in /Applications."
+# Uninstalling every Brave must not strand what this tool wrote. On Linux the
+# policy file lives in /etc and survives the package, so `deactivate` and
+# `status` go on with zero installs found as long as a receipt is there to act
+# on. `activate` still has nothing to target, and says so.
+if [[ ${#FOUND_IDX[@]} -eq 0 ]] && { [[ "$CMD" == "activate" ]] || ! any_receipt; }; then
+  [[ "$PLATFORM" == "macos" ]] && err "No Brave install found in /Applications."
+  [[ -e "${SNAP_BRAVE:-}" ]] && err "Only the snap build of Brave is installed, and it cannot be governed this way.
+    Snap's AppArmor profile lets Brave read policies from /etc/opt/chrome and
+    /etc/chromium only, so a file under /etc/brave/policies would be written
+    successfully and then ignored. Install the .deb/.rpm from brave.com, or the
+    Flatpak, and re-run."
+  err "No Brave install found under /opt/brave.com."
+fi
+[[ -e "${SNAP_BRAVE:-}" ]] && \
+  warn "A snap Brave is also installed. Policies cannot reach it — its AppArmor profile does not allow reading /etc/brave."
 
 pick_channel() {
   local idx="$1"
   APP_PATH="${CH_APP[$idx]}"; BUNDLE_ID="${CH_ID[$idx]}"
-  DATA_DIR="${CH_DATA[$idx]}"; CHANNEL_NAME="$(basename "${CH_APP[$idx]}" .app)"
+  DATA_DIR="${CH_DATA[$idx]}"; CHANNEL_NAME="${CH_NAME[$idx]}"
+  PKG_NAME="${CH_PKG[$idx]}"; CHANNEL_KIND="${CH_KIND[$idx]}"
+  USER_DATA="${CH_PROFILE[$idx]}"
 }
 
 if [[ -n "$FORCE_CHANNEL" ]]; then
@@ -176,36 +321,83 @@ if [[ -n "$FORCE_CHANNEL" ]]; then
     [[ "${CH_ID[$i]}" == "$FORCE_CHANNEL" ]] && { pick_channel "$i"; matched=1; break; }
   done
   [[ $matched -eq 1 ]] || err "Unknown channel '$FORCE_CHANNEL'."
-  [[ -d "$APP_PATH" ]] || err "'$CHANNEL_NAME' is not installed."
+  if ! channel_installed "$APP_PATH"; then
+    # An uninstalled channel can still hold a receipt, and on Linux still hold
+    # an entry in the refcount on the shared policy file. Refusing here is what
+    # made that entry impossible to release.
+    [[ "$CMD" == "activate" ]] && err "'$CHANNEL_NAME' is not installed."
+    channel_has_receipt "$FORCE_CHANNEL" || \
+      err "'$CHANNEL_NAME' is not installed and has no receipt, so there is nothing to act on."
+    warn "'$CHANNEL_NAME' is no longer installed. Acting on its receipt alone."
+  fi
 else
   chosen=""
   for i in "${FOUND_IDX[@]}"; do
     [[ "${CH_ID[$i]}" == "com.brave.Browser.origin" ]] && continue
     chosen="$i"; break
   done
+  if [[ -z "$chosen" && "$CMD" != "activate" ]]; then
+    # Nothing installed to default to, so default to what there is a receipt
+    # for — that state is exactly what deactivate and status exist to reach.
+    for i in "${!CH_ID[@]}"; do
+      if channel_has_receipt "${CH_ID[$i]}"; then chosen="$i"; break; fi
+    done
+  fi
   [[ -z "$chosen" ]] && err "Only Brave Origin standalone is installed — its features are already compiled out."
   pick_channel "$chosen"
 fi
 
 [[ "$BUNDLE_ID" == "com.brave.Browser.origin" ]] && \
   warn "Target is the Brave Origin standalone build; its features are compiled out."
+[[ "$CHANNEL_KIND" == "flatpak" ]] && \
+  warn "Flatpak Brave: the host's managed policies are symlinked in by brave.sh at launch, so a full restart is required before any of this takes effect."
 
 # ── Paths ────────────────────────────────────────────────────────────────────
-# The per-user path is what PolicyLoaderMac::GetManagedPolicyPath() builds and
-# file-watches, and it yields POLICY_SCOPE_USER, matching Brave Origin itself.
-# The machine-wide path is also read, but only on the 15-minute poll, and
-# reports MACHINE scope.
+# macOS: the per-user path is what PolicyLoaderMac::GetManagedPolicyPath()
+# builds and file-watches, and it yields POLICY_SCOPE_USER, matching Brave
+# Origin itself. The machine-wide path is also read, but only on the 15-minute
+# poll, and reports MACHINE scope.
 MP_ROOT="/Library/Managed Preferences"
+# Linux: app/brave_main_delegate.cc registers this with create=false, so nothing
+# in Brave ever creates it — activate has to mkdir -p it. Every channel reads
+# the same directory, so there is no per-channel policy scoping there at all.
+LINUX_POLICY_ROOT="/etc/brave/policies"
+if [[ "$PLATFORM" == "linux" ]]; then POLICY_DIR_ROOT="$LINUX_POLICY_ROOT"
+else                                  POLICY_DIR_ROOT="$MP_ROOT"; fi
+
 if [[ "$SCOPE" == "user" ]]; then PLIST_DIR="${MP_ROOT}/${TARGET_USER}"
 else                              PLIST_DIR="${MP_ROOT}"; fi
 PLIST="${PLIST_DIR}/${BUNDLE_ID}.plist"
-# Repeated back to the user in rollback instructions, so the command printed
-# targets the scope this run actually wrote.
-SCOPE_FLAG=""; [[ "$SCOPE" == "machine" ]] && SCOPE_FLAG=" --machine"
 USER_PLIST="${MP_ROOT}/${TARGET_USER}/${BUNDLE_ID}.plist"
 MACHINE_PLIST="${MP_ROOT}/${BUNDLE_ID}.plist"
 
-RECEIPT_DIR="/Library/Application Support/brave-origin-clone"
+# The one artefact this run writes policy into. On Linux that is a file of our
+# own under managed/, read alongside every other *.json there in lexicographic
+# order, last file winning.
+LINUX_MANAGED_DIR=""
+if [[ "$PLATFORM" == "linux" ]]; then
+  LINUX_MANAGED_DIR="${POLICY_DIR_ROOT}/managed"
+  POLICY_STORE="${LINUX_MANAGED_DIR}/brave-to-origin.json"
+  # Brave reports any unknown key in managed/ as an unrecognised policy, so the
+  # "this file is ours" marker cannot live inside it. It goes in a sibling
+  # OUTSIDE managed/, which Brave never reads.
+  POLICY_META="${POLICY_DIR_ROOT}/brave-to-origin.meta.json"
+  # Linux policy has no user scope to choose. Accept --machine, ignore it, and
+  # pin the receipt name so `activate --machine` and `activate` cannot end up
+  # with two receipts describing one file.
+  [[ "$SCOPE" == "machine" ]] && \
+    info "--machine noted: Linux policy is always machine scope, so it changes nothing."
+  SCOPE="machine"
+else
+  POLICY_STORE="$PLIST"
+  POLICY_META=""
+fi
+
+# Repeated back to the user in rollback instructions, so the command printed
+# targets the scope this run actually wrote.
+SCOPE_FLAG=""
+[[ "$PLATFORM" == "macos" && "$SCOPE" == "machine" ]] && SCOPE_FLAG=" --machine"
+
 # One receipt per scope. `activate` followed by `activate --machine` populates
 # two plists, and a single receipt can only ever describe one of them — the
 # other would be left enforcing policy with nothing able to roll it back.
@@ -214,7 +406,7 @@ RECEIPT="${RECEIPT_DIR}/${BUNDLE_ID}.${SCOPE}.json"
 # and absorbed by `activate` when its "plist" names the path this run targets.
 LEGACY_RECEIPT="${RECEIPT_DIR}/${BUNDLE_ID}.json"
 
-USER_DATA="${TARGET_HOME}/Library/Application Support/BraveSoftware/${DATA_DIR}"
+# USER_DATA came from pick_channel: the layouts differ too much to rebuild here.
 LOCAL_STATE="${USER_DATA}/Local State"
 
 # ── The 16 Brave Origin policies ─────────────────────────────────────────────
@@ -240,6 +432,21 @@ declare -a POLICIES=(
   "PsstEnabled|false|locked"
 )
 
+# Compiled out on Linux for good, not merely absent from this build: the
+# enable_brave_vpn_v1 / enable_brave_vpn_v2 buildflags omit is_linux, so the
+# policy is never registered there. Writing it anyway would only add a row at
+# brave://policy reading "unknown policy", so it is reported inert and skipped.
+declare -a LINUX_UNSUPPORTED=("BraveVPNDisabled")
+
+platform_supports() {
+  [[ "$PLATFORM" == "macos" ]] && return 0
+  local k
+  for k in "${LINUX_UNSUPPORTED[@]}"; do
+    [[ "$k" == "$1" ]] && return 1
+  done
+  return 0
+}
+
 # Standalone-build defaults with no policy equivalent. Format: pref|value
 declare -a PROFILE_PREFS=(
   "brave.show_side_panel_button|false"
@@ -254,17 +461,26 @@ declare -a LOCAL_STATE_PREFS=(
 )
 
 # ── Capability probe ─────────────────────────────────────────────────────────
-# PolicyLoaderMac::Load() walks the compiled-in schema and only queries keys it
-# finds there. An unknown key is never read: no value, no error, no row at
+# The policy loader walks the compiled-in schema and only queries keys it finds
+# there. An unknown key is never read: no value, no error, no row at
 # brave://policy. Probe the shipped binary so that is visible rather than silent.
 SUPPORTED_KEYS=""
 probe_supported_keys() {
   local fw keyfile
-  # `|| true`: under pipefail a `find` miss (or head's SIGPIPE) would otherwise
-  # abort the run before the graceful branch below is ever reached.
-  fw=$(find "${APP_PATH}/Contents/Frameworks" -maxdepth 4 -name "Brave*Framework" -type f -print -quit 2>/dev/null || true)
+  if [[ "$PLATFORM" == "macos" ]]; then
+    # `|| true`: under pipefail a `find` miss (or head's SIGPIPE) would otherwise
+    # abort the run before the graceful branch below is ever reached.
+    fw=$(find "${APP_PATH}/Contents/Frameworks" -maxdepth 4 -name "Brave*Framework" -type f -print -quit 2>/dev/null || true)
+  elif [[ "$CHANNEL_KIND" == "flatpak" ]]; then
+    # Best effort: /app is the deployment's files/ directory. If the layout
+    # differs the probe degrades to "unknown", which is handled below.
+    fw="${APP_PATH}/current/active/files/brave/brave"
+  else
+    # Linux links the policy schema into the main ELF.
+    fw="$APP_PATH"
+  fi
   if [[ -z "$fw" || ! -f "$fw" ]]; then
-    warn "Framework binary not found; cannot verify which policies this build knows."
+    warn "Brave binary not found; cannot verify which policies this build knows."
     SUPPORTED_KEYS="__PROBE_UNAVAILABLE__"; return
   fi
   keyfile=$(mktemp) || { SUPPORTED_KEYS="__PROBE_UNAVAILABLE__"; return; }
@@ -284,14 +500,32 @@ probe_supported_keys() {
 }
 
 is_supported() {
+  platform_supports "$1" || return 1
   [[ "$SUPPORTED_KEYS" == "__PROBE_UNAVAILABLE__" ]] && return 0
   grep -qx "$1" <<< "$SUPPORTED_KEYS"
 }
 
+# Why a key is inert, which is not the same answer in both cases: one is a
+# build that has not shipped it yet, the other never will.
+inert_reason() {
+  if platform_supports "$1"; then echo "not in this build"
+  else                            echo "compiled out on Linux"; fi
+}
+
 # ── Brave must not be running ────────────────────────────────────────────────
-# Match on the bundle name, not the detected path, so a copy launched from
-# ~/Applications or a mounted DMG is still caught.
-brave_running() { pgrep -f "${CHANNEL_NAME}\.app/Contents/MacOS/" >/dev/null 2>&1; }
+# macOS matches on the bundle name, not the detected path, so a copy launched
+# from ~/Applications or a mounted DMG is still caught. Linux has one install
+# location per channel, so the install path is the match.
+if [[ "$PLATFORM" == "macos" ]]; then
+  BRAVE_PROC_MATCH="${CHANNEL_NAME}\.app/Contents/MacOS/"
+elif [[ "$CHANNEL_KIND" == "flatpak" ]]; then
+  # A Flatpak's own binary path is inside the sandbox; the app ID is what shows
+  # up in the host's view of the bwrap command line.
+  BRAVE_PROC_MATCH="$FLATPAK_ID"
+else
+  BRAVE_PROC_MATCH="$APP_PATH"
+fi
+brave_running() { pgrep -f "$BRAVE_PROC_MATCH" >/dev/null 2>&1; }
 
 require_brave_closed() {
   brave_running && err "${CHANNEL_NAME} is running. Quit it completely, then re-run.
@@ -362,14 +596,6 @@ plist_delete_verified() {
 
 plist_parses() { plutil -lint "$1" >/dev/null 2>&1; }
 
-# Read-only half of ensure_plist, so activate can validate before it captures
-# priors and long before it writes anything.
-check_plist_readable() {
-  if [[ -f "${PLIST}" ]] && ! plist_parses "${PLIST}"; then
-    err "${PLIST} exists but is not a valid plist. Refusing to touch it."
-  fi
-}
-
 ensure_plist() {
   # Only set ownership on a directory we created. An existing one may have been
   # tightened deliberately by an admin, or be managed by mdmclient.
@@ -378,7 +604,7 @@ ensure_plist() {
     chown root:wheel "${PLIST_DIR}" 2>/dev/null || true
     chmod 755 "${PLIST_DIR}" 2>/dev/null || true
   fi
-  check_plist_readable
+  check_policy_store_readable
   # Same reasoning for the file: an admin may have tightened an existing plist
   # to 0600, and widening it back to 644 is not this script's call. Ownership
   # and mode are set only on a plist this run brought into existence.
@@ -390,9 +616,12 @@ ensure_plist() {
   fi
 }
 
-finalize_plist() {
+finalize_policy_store() {
   # cfprefsd caches preference domains and can write its stale copy back over
-  # the file. Brave's own docs prescribe this after a PlistBuddy edit.
+  # the file. Brave's own docs prescribe this after a PlistBuddy edit. Linux
+  # needs no equivalent: a FilePathWatcher on the policy directory picks the
+  # file up, with the 15-minute poll as a backstop.
+  [[ "$PLATFORM" == "macos" ]] || return 0
   killall cfprefsd 2>/dev/null || true
 }
 
@@ -403,6 +632,292 @@ plist_key_count() {
   [[ -f "$f" ]] || { echo 0; return; }
   n=$(pb -c "Print" "$f" 2>/dev/null | grep -c "^    [^ ].* = " || true)
   echo "${n:-0}"
+}
+
+# ── Linux policy store ───────────────────────────────────────────────────────
+# Brave on Linux reads EVERY *.json under /etc/brave/policies/managed/, in
+# lexicographic order with the last file winning, always at machine scope. So
+# this owns one file outright instead of editing a shared one, and the typed
+# priors the macOS plist needs do not apply here: rollback is "put the exact
+# prior bytes back, or delete the file".
+#
+# That directory is global while this tool is per-channel, so the refcount
+# below records which channels are relying on it. Without it,
+# activate stable → activate beta → deactivate stable would silently strip
+# beta's policies as well.
+POLICY_REFCOUNT="${RECEIPT_DIR}/policy-store.json"
+
+json_parses() {
+  F="$1" python3 -c \
+    'import json, os; json.load(open(os.environ["F"], encoding="utf-8"))' 2>/dev/null
+}
+
+# One program for every mode, because each of them needs the same atomic write
+# — temp file in the same directory, fsync, rename — and three copies of that
+# is three chances to get it wrong. MODE selects the operation; every value
+# reaches it through the environment.
+#
+#   write          write the policy file and its provenance sibling
+#   refcount-add   record the prior file, then add $2 to the channel list
+#   release        drop $2; restore the prior only once the list is empty
+#   release-dry    the same decision, reported and not taken
+#   meta-owns      exit 0 when the marker says the store is ours
+#   report         one "key<TAB>current" line per policy key
+#   conflicts      other files in managed/ that set any of our keys
+linux_policy_store() {
+  MODE="$1" CH="${2:-}" STORE="$POLICY_STORE" META="$POLICY_META" \
+  RC="$POLICY_REFCOUNT" MANAGED="$LINUX_MANAGED_DIR" \
+  KEYS="$(printf '%s\n' "${POLICIES[@]}")" \
+  SKIP="$(printf '%s\n' "${LINUX_UNSUPPORTED[@]}")" \
+  UNDO_CMD="${SELF_CMD} deactivate --channel ${BUNDLE_ID}" python3 - <<'PY'
+import base64, json, os, sys, tempfile, time
+
+mode    = os.environ["MODE"]
+store   = os.environ["STORE"]
+meta    = os.environ["META"]
+rcpath  = os.environ["RC"]
+managed = os.environ["MANAGED"]
+
+def policy_keys():
+    for line in os.environ["KEYS"].split("\n"):
+        if not line.strip():
+            continue
+        key, _, rest = line.partition("|")
+        yield key, rest.partition("|")[0] == "true"
+
+SKIPPED = {k for k in os.environ["SKIP"].split("\n") if k}
+
+def atomic_write(path, data, bits=0o644):
+    if os.path.islink(path):
+        # os.replace would swap the symlink itself for a regular file, which is
+        # not "putting it back": the admin pointed this name somewhere on
+        # purpose. Refuse instead of flattening it.
+        raise ValueError("%s is a symlink; refusing to replace it with a regular file" % path)
+    directory = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".brave-to-origin-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, bits)
+        os.replace(tmp, path)
+        dfd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+def as_json(obj):
+    return (json.dumps(obj, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+def load_refcount():
+    with open(rcpath, encoding="utf-8") as fh:
+        rec = json.load(fh)
+    # A malformed one must abort rather than be replaced: it holds the only
+    # copy of the prior file's bytes.
+    if (not isinstance(rec, dict) or not isinstance(rec.get("prior"), dict)
+            or not isinstance(rec.get("channels"), list)
+            # A non-string member survives every check the release path makes
+            # and then blows up inside ",".join(), leaving the store held by a
+            # refcount nothing can ever decrement.
+            or not all(isinstance(c, str) for c in rec["channels"])):
+        raise ValueError("policy-store receipt is malformed: " + rcpath)
+    return rec
+
+def meta_claims_store():
+    # The marker outside managed/ is the only evidence of whose file this is.
+    # Without consulting it, a store WE wrote is indistinguishable from a third
+    # party's prior — and recording our own file as the prior means no
+    # deactivate ever removes it.
+    try:
+        with open(meta, encoding="utf-8") as fh:
+            rec = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    return isinstance(rec, dict) and rec.get("policy_file") == store
+
+def capture_prior():
+    if os.path.islink(store):
+        raise ValueError("%s is a symlink; refusing to record or replace it" % store)
+    if not os.path.isfile(store) or meta_claims_store():
+        return {"state": "absent"}
+    st = os.stat(store)
+    with open(store, "rb") as fh:
+        # base64 so the record is exact for any byte sequence, including a file
+        # that is not valid UTF-8 and not valid JSON. Mode and ownership are
+        # part of the prior too: restoring a 0600 file as 0644 widens it.
+        return {"state": "present",
+                "b64": base64.b64encode(fh.read()).decode("ascii"),
+                "mode": st.st_mode & 0o7777, "uid": st.st_uid, "gid": st.st_gid}
+
+def restore_prior(prior):
+    bits = prior.get("mode")
+    if not isinstance(bits, int) or not 0 <= bits <= 0o7777:
+        bits = 0o644
+    atomic_write(store, base64.b64decode(prior["b64"]), bits=bits)
+    uid, gid = prior.get("uid"), prior.get("gid")
+    if isinstance(uid, int) and isinstance(gid, int):
+        st = os.stat(store)
+        if (st.st_uid, st.st_gid) != (uid, gid):
+            try:
+                os.chown(store, uid, gid)
+            except OSError as exc:
+                raise ValueError(
+                    "restored %s but could not put its ownership back: %s" % (store, exc))
+
+def run():
+    if mode == "write":
+        atomic_write(store, as_json({k: v for k, v in policy_keys() if k not in SKIPPED}))
+        # The marker lives OUTSIDE managed/, where Brave never looks. Inside it,
+        # any key that is not a policy name is reported as an unknown policy.
+        atomic_write(meta, as_json({
+            "_comment": "written by brave-to-origin; remove with: " + os.environ["UNDO_CMD"],
+            "policy_file": store,
+            "written_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }))
+
+    elif mode == "prior-json":
+        # Hand the prior back so activate can mirror it into the per-channel
+        # receipt, because losing one record must not lose the prior. An
+        # existing refcount holds the EARLIEST prior and wins; with no refcount
+        # yet, the file on disk is the prior.
+        if os.path.isfile(rcpath):
+            sys.stdout.write(json.dumps(load_refcount().get("prior", {})))
+        else:
+            sys.stdout.write(json.dumps(capture_prior()))
+
+    elif mode == "restore-prior":
+        prior = json.loads(os.environ["PRIOR_JSON"])
+        restore_prior(prior)
+
+    elif mode == "refcount-add":
+        if os.path.isfile(rcpath):
+            rec = load_refcount()
+        else:
+            rec = {"store": store, "prior": capture_prior(), "channels": []}
+        if os.environ["CH"] not in rec["channels"]:
+            rec["channels"].append(os.environ["CH"])
+        rec["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        atomic_write(rcpath, as_json(rec))
+
+    elif mode in ("release", "release-dry"):
+        if not os.path.isfile(rcpath):
+            sys.exit(3)
+        rec = load_refcount()
+        remaining = [c for c in rec["channels"] if c != os.environ["CH"]]
+        if remaining:
+            print("remaining\t" + ",".join(remaining))
+            if mode == "release":
+                rec["channels"] = remaining
+                rec["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+                atomic_write(rcpath, as_json(rec))
+            sys.exit(0)
+        prior = rec["prior"]
+        print("restored" if prior.get("state") == "present" else "removed")
+        if mode == "release-dry":
+            sys.exit(0)
+        if prior.get("state") == "present":
+            restore_prior(prior)
+        elif os.path.exists(store):
+            os.unlink(store)
+        for path in (meta, rcpath):
+            if os.path.exists(path):
+                os.unlink(path)
+
+    elif mode == "meta-owns":
+        # Asked when the refcount has gone missing: is this store still one of
+        # ours, and therefore ours to remove?
+        sys.exit(0 if meta_claims_store() else 1)
+
+    elif mode == "report":
+        data = {}
+        if os.path.isfile(store):
+            try:
+                with open(store, encoding="utf-8") as fh:
+                    data = json.load(fh)
+            except (OSError, ValueError):
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+        for key, _ in policy_keys():
+            if key not in data:
+                current = "(unset)"
+            elif isinstance(data[key], bool):
+                current = "true" if data[key] else "false"
+            else:
+                current = "(%s)" % type(data[key]).__name__
+            print(key + "\t" + current)
+
+    elif mode == "conflicts":
+        ours = os.path.basename(store)
+        mine = {k for k, _ in policy_keys()}
+        try:
+            names = sorted(f for f in os.listdir(managed) if f.endswith(".json"))
+        except OSError:
+            names = []
+        for name in names:
+            if name == ours:
+                continue
+            try:
+                with open(os.path.join(managed, name), encoding="utf-8") as fh:
+                    data = json.load(fh)
+            except (OSError, ValueError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            hits = sorted(mine & set(data))
+            if hits:
+                # Lexicographic order decides: a later filename overrides ours.
+                print("%s\t%s\t%s" % (name, "overrides" if name > ours else "overridden by ours",
+                                      ",".join(hits)))
+
+# A traceback on a root terminal buries the one line that says what to do, and
+# every failure here is a corrupt file or an unwritable path.
+try:
+    run()
+except (ValueError, OSError) as exc:
+    sys.exit(str(exc))
+PY
+}
+
+# Read-only half of ensure_policy_store, so activate can validate before it
+# captures priors and long before it writes anything.
+check_policy_store_readable() {
+  if [[ "$PLATFORM" == "macos" ]]; then
+    if [[ -f "${PLIST}" ]] && ! plist_parses "${PLIST}"; then
+      err "${PLIST} exists but is not a valid plist. Refusing to touch it."
+    fi
+    return 0
+  fi
+  # A symlinked store is refused here, before a receipt exists, rather than by
+  # the writer: replacing it would turn a link an admin pointed somewhere on
+  # purpose into a regular file, and no rollback puts that back.
+  [[ -L "${POLICY_STORE}" ]] && \
+    err "${POLICY_STORE} is a symlink. Refusing to replace it with a regular file — remove or repoint it first."
+  # Not a refusal on Linux: a brave-to-origin.json that does not parse is one
+  # Brave already ignores, and its exact bytes are recorded before it is
+  # replaced, so the overwrite stays reversible.
+  if [[ -f "${POLICY_STORE}" ]] && ! json_parses "${POLICY_STORE}"; then
+    warn "${POLICY_STORE} is not valid JSON, so Brave is ignoring it. Its exact bytes are recorded before it is replaced."
+  fi
+  return 0
+}
+
+# The directory is registered with create=false in app/brave_main_delegate.cc,
+# so nothing in Brave ever creates it.
+ensure_linux_policy_dir() {
+  if [[ ! -d "${LINUX_MANAGED_DIR}" ]]; then
+    mkdir -p "${LINUX_MANAGED_DIR}" || err "Could not create ${LINUX_MANAGED_DIR}."
+    chmod 755 "${POLICY_DIR_ROOT}" "${LINUX_MANAGED_DIR}" 2>/dev/null || true
+  fi
+  return 0
 }
 
 # ── Capturing plist priors ───────────────────────────────────────────────────
@@ -627,15 +1142,17 @@ except ValueError as exc:
     sys.exit(str(exc))
 " || err "Refusing to write a malformed receipt to ${RECEIPT}."
 
-  mkdir -p "$RECEIPT_DIR"; chown root:wheel "$RECEIPT_DIR" 2>/dev/null || true
-  chmod 755 "$RECEIPT_DIR" 2>/dev/null || true
+  # 0700: a receipt holds the user's own profile-pref values, which nothing but
+  # root has any business reading back out of /var/lib or /Library.
+  mkdir -p "$RECEIPT_DIR"; chown_root "$RECEIPT_DIR"
+  chmod 700 "$RECEIPT_DIR" 2>/dev/null || true
   # Atomic: a truncating `>` that fails partway would destroy the only record
   # of the priors, which is exactly the loss the receipt exists to prevent.
   local tmp
   tmp=$(mktemp "${RECEIPT_DIR}/.receipt.XXXXXX") || err "Could not write ${RECEIPT}."
   printf '%s\n' "$payload" > "$tmp" || { rm -f "$tmp"; err "Could not write ${RECEIPT}."; }
-  chown root:wheel "$tmp" 2>/dev/null || true
-  chmod 644 "$tmp" 2>/dev/null || true
+  chown_root "$tmp"
+  chmod 600 "$tmp" 2>/dev/null || true
   mv -f "$tmp" "$RECEIPT" || { rm -f "$tmp"; err "Could not write ${RECEIPT}."; }
 }
 
@@ -664,7 +1181,10 @@ print(f\"{rec.get('scope', '?')} scope · {rec.get('state', 'complete')} · {rec
 " 2>/dev/null || echo "unreadable"
 }
 
+# macOS only: this is what decides whether PolicyLoaderMac filters the policies
+# flagged sensitive:true. Linux has no equivalent filter.
 device_is_managed() {
+  [[ "$PLATFORM" == "macos" ]] || return 1
   local enr ad
   enr=$(profiles status -type enrollment 2>/dev/null || true)
   grep -q "MDM enrollment: Yes" <<< "$enr" && return 0
@@ -675,7 +1195,27 @@ device_is_managed() {
 }
 
 installed_version() {
-  defaults read "${APP_PATH}/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null || echo "unknown"
+  if [[ "$PLATFORM" == "macos" ]]; then
+    defaults read "${APP_PATH}/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null || echo "unknown"
+    return 0
+  fi
+  local v=""
+  if [[ -n "$PKG_NAME" ]] && command -v dpkg-query >/dev/null 2>&1; then
+    v=$(dpkg-query -W -f='${Version}' "$PKG_NAME" 2>/dev/null || true)
+    # A Debian version carries an epoch and a revision that Brave's own version
+    # string does not: 1:1.94.117-1 is the same build as 1.94.117.
+    v="${v#*:}"; v="${v%%-*}"
+  fi
+  if [[ -z "$v" && -n "$PKG_NAME" ]] && command -v rpm >/dev/null 2>&1; then
+    v=$(rpm -q --qf '%{VERSION}' "$PKG_NAME" 2>/dev/null || true)
+  fi
+  # Last resort, and the only one a Flatpak or a tarball install answers to.
+  # As the user, never as root: this launches the browser binary.
+  if [[ -z "$v" && -x "$APP_PATH" && ! -d "$APP_PATH" ]]; then
+    v=$(as_user "$APP_PATH" --product-version 2>/dev/null || true)
+  fi
+  v="${v%%$'\n'*}"
+  [[ -n "$v" ]] && echo "$v" || echo "unknown"
 }
 
 # ── ACTIVATE ─────────────────────────────────────────────────────────────────
@@ -722,7 +1262,8 @@ prior_receipt() {
 receipt_build() {
   local priors_file="$1" pref_priors="$2" state="$3" existing="$4"
   POLJSON="$priors_file" PREFS="$pref_priors" EXISTING="$existing" \
-  STATE="$state" PLIST_P="$PLIST" SCOPE_P="$SCOPE" BID="$BUNDLE_ID" \
+  STATE="$state" PLIST_P="$POLICY_STORE" SCOPE_P="$SCOPE" BID="$BUNDLE_ID" \
+  POLICY_PRIOR="${POLICY_STORE_PRIOR:-}" \
   VER="$(installed_version)" python3 - <<'PY'
 import json, os, sys, time
 
@@ -763,9 +1304,16 @@ if old_receipt and os.path.isfile(old_receipt):
 
 print(json.dumps({
     "bundle_id": os.environ["BID"], "scope": os.environ["SCOPE_P"],
+    # "plist" is the historical field name and every reader keys off it; on
+    # Linux it holds the path of the managed JSON file instead.
     "plist": os.environ["PLIST_P"], "brave_version": os.environ["VER"],
     "written_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     "state": os.environ["STATE"],
+    # Mirrored from the policy-store record on Linux. Redundant on purpose: it
+    # is the only copy of a third party's policy file that survives losing
+    # policy-store.json, and destroying theirs is the one thing this must never do.
+    **({"policy_store_prior": json.loads(os.environ["POLICY_PRIOR"])}
+       if os.environ.get("POLICY_PRIOR") else {}),
     "policies_prior": pol, "prefs_prior": prefs,
 }, indent=2))
 PY
@@ -774,7 +1322,7 @@ PY
 legacy_receipt_matches() {
   local p
   p=$(receipt_load "$LEGACY_RECEIPT" 2>/dev/null | head -n 1) || return 1
-  [[ "$p" == "$PLIST" ]]
+  [[ "$p" == "$POLICY_STORE" ]]
 }
 
 # The receipt is written provisionally before the first mutation and marked
@@ -796,11 +1344,16 @@ print(json.dumps(rec, indent=2))
 activate_dry_run() {
   local entry key val settable note f
   section "Brave Origin policies"
+  [[ "$PLATFORM" == "linux" ]] && skip "would write ${POLICY_STORE}"
   for entry in "${POLICIES[@]}"; do
     IFS="|" read -r key val settable <<< "$entry"
     note=""
-    is_supported "$key" || note=" ${DIM}(inert: not in this build)${RESET}"
-    skip "would set ${key} = ${val}${note}"
+    is_supported "$key" || note=" ${DIM}(inert: $(inert_reason "$key"))${RESET}"
+    if platform_supports "$key"; then
+      skip "would set ${key} = ${val}${note}"
+    else
+      skip "would skip ${key}${note}"
+    fi
   done
 
   section "Standalone-build defaults (profile prefs)"
@@ -813,10 +1366,86 @@ activate_dry_run() {
   echo "  Dry run — no changes made."
 }
 
+# Both apply_policies_* read and update cmd_activate's applied/inert/failed
+# counters, which its `local` puts in scope for anything it calls.
+apply_policies_macos() {
+  local entry key val settable note reason
+  ensure_plist
+  for entry in "${POLICIES[@]}"; do
+    IFS="|" read -r key val settable <<< "$entry"
+    note=""
+    is_supported "$key" || note=" ${DIM}(inert: not in this build)${RESET}"
+    [[ -n "$note" ]] && (( inert++ )) || true
+
+    reason=$(refusal_reason "$key")
+    if [[ -n "$reason" ]]; then
+      fail "${key} — left untouched: ${reason}, which cannot be restored exactly"
+      (( failed++ )) || true
+      continue
+    fi
+
+    if plist_set_bool_verified "$PLIST" "$key" "$val"; then
+      ok "${key} = ${val} ${DIM}(${settable})${RESET}${note}"
+      (( applied++ )) || true
+    else
+      fail "${key} — write did NOT take effect"
+      (( failed++ )) || true
+    fi
+  done
+  return 0
+}
+
+# One file, written whole. There is no per-key verification to do: the writer
+# renames a fully written temp file into place or raises, so a partial or
+# failed write is an error here rather than a policy that silently did not land.
+apply_policies_linux() {
+  local entry key val settable note
+  ensure_linux_policy_dir
+  # The refcount records the prior file, so it has to exist before the file it
+  # protects is overwritten — afterwards, the "prior" would be our own writing.
+  linux_policy_store refcount-add "$BUNDLE_ID" \
+    || err "Could not record the policy-store state at ${POLICY_REFCOUNT}; nothing was written."
+  linux_policy_store write || err "Could not write ${POLICY_STORE}."
+
+  for entry in "${POLICIES[@]}"; do
+    IFS="|" read -r key val settable <<< "$entry"
+    if ! platform_supports "$key"; then
+      skip "${key} — not written (inert: $(inert_reason "$key"))"
+      (( unwritable++ )) || true
+      continue
+    fi
+    note=""
+    if ! is_supported "$key"; then
+      note=" ${DIM}(inert: $(inert_reason "$key"))${RESET}"
+      (( inert++ )) || true
+    fi
+    ok "${key} = ${val} ${DIM}(${settable})${RESET}${note}"
+    (( applied++ )) || true
+  done
+  # Only the OTHER channels are news; naming the one just activated reads as if
+  # something else were already relying on the file.
+  local others; others=$(policy_store_channels "$BUNDLE_ID")
+  if [[ -n "$others" && "$others" != "unknown" ]]; then
+    info "Policy file: ${POLICY_STORE} ${DIM}(also active for: ${others})${RESET}"
+  else
+    info "Policy file: ${POLICY_STORE}"
+  fi
+  return 0
+}
+
+# The channels currently relying on the shared Linux policy file, minus $1.
+policy_store_channels() {
+  RC="$POLICY_REFCOUNT" SKIP_CH="${1:-}" python3 -c \
+    'import json, os
+rec = json.load(open(os.environ["RC"], encoding="utf-8"))
+print(", ".join(c for c in rec["channels"] if c != os.environ["SKIP_CH"]))' \
+    2>/dev/null || echo "unknown"
+}
+
 cmd_activate() {
   section "Brave Origin — activating"
   info "Target : ${CHANNEL_NAME} (${BUNDLE_ID}) $(installed_version)"
-  info "Policy : ${PLIST}  [${SCOPE} scope]"
+  info "Policy : ${POLICY_STORE}  [${SCOPE} scope]"
   info "User   : ${TARGET_USER}"
 
   if [[ $DRY_RUN -eq 1 ]]; then
@@ -828,16 +1457,23 @@ cmd_activate() {
 
   require_brave_closed
   probe_supported_keys
-  check_plist_readable
+  check_policy_store_readable
 
   # ── Capture ────────────────────────────────────────────────────────────────
   # Nothing below this heading writes; nothing above the receipt does either.
   section "Reading current values"
   local priors_file; priors_file=$(mktemp) || err "mktemp failed"
-  REFUSED_PRIORS=$(capture_policy_priors "$PLIST" "$priors_file") || {
-    rm -f "$priors_file"
-    err "Could not read the existing policy values from ${PLIST}."
-  }
+  if [[ "$PLATFORM" == "macos" ]]; then
+    REFUSED_PRIORS=$(capture_policy_priors "$POLICY_STORE" "$priors_file") || {
+      rm -f "$priors_file"
+      err "Could not read the existing policy values from ${POLICY_STORE}."
+    }
+  else
+    # No per-key priors on Linux: the managed file is ours alone, and its prior
+    # is recorded whole — exact bytes or "absent" — in the policy-store receipt.
+    REFUSED_PRIORS=""
+    printf '{}' > "$priors_file"
+  fi
 
   local pairs; pairs=$(printf '%s\n' "${PROFILE_PREFS[@]}")
   local ls_pairs; ls_pairs=$(printf '%s\n' "${LOCAL_STATE_PREFS[@]}")
@@ -868,6 +1504,9 @@ cmd_activate() {
   ok "${#POLICIES[@]} policy key(s), ${#captured_files[@]} profile pref file(s), ${ls_note}"
 
   # ── Receipt, before the first write ────────────────────────────────────────
+  # The policy file's prior has to be in the receipt before anything is written,
+  # for the same reason every other prior is.
+  [[ "$PLATFORM" == "linux" ]] && POLICY_STORE_PRIOR=$(linux_policy_store prior-json || true)
   local existing; existing=$(prior_receipt)
   [[ "$existing" == "$LEGACY_RECEIPT" ]] && RECEIPT_MIGRATED_LEGACY=1
   local payload
@@ -882,31 +1521,11 @@ cmd_activate() {
   trap activate_interrupted INT TERM HUP
 
   # ── Mutate ─────────────────────────────────────────────────────────────────
-  local applied=0 inert=0 failed=0 entry key val settable note reason
+  local applied=0 inert=0 failed=0 unwritable=0
   section "Brave Origin policies"
-  ensure_plist
-  for entry in "${POLICIES[@]}"; do
-    IFS="|" read -r key val settable <<< "$entry"
-    note=""
-    is_supported "$key" || note=" ${DIM}(inert: not in this build)${RESET}"
-    [[ -n "$note" ]] && (( inert++ )) || true
-
-    reason=$(refusal_reason "$key")
-    if [[ -n "$reason" ]]; then
-      fail "${key} — left untouched: ${reason}, which cannot be restored exactly"
-      (( failed++ )) || true
-      continue
-    fi
-
-    if plist_set_bool_verified "$PLIST" "$key" "$val"; then
-      ok "${key} = ${val} ${DIM}(${settable})${RESET}${note}"
-      (( applied++ )) || true
-    else
-      fail "${key} — write did NOT take effect"
-      (( failed++ )) || true
-    fi
-  done
-  finalize_plist
+  if [[ "$PLATFORM" == "macos" ]]; then apply_policies_macos
+  else                                  apply_policies_linux; fi
+  finalize_policy_store
 
   section "Standalone-build defaults (profile prefs)"
   for f in ${captured_files[@]+"${captured_files[@]}"}; do
@@ -935,6 +1554,7 @@ cmd_activate() {
   local ls_state="written"; [[ $ls_captured -eq 1 ]] || ls_state="${YELLOW}skipped${RESET}"
   echo "  Prefs written    : ${#captured_files[@]} profile file(s), Local State ${ls_state}"
   [[ $inert   -gt 0 ]] && echo "  Inert this build : ${inert} ${DIM}(written, ignored until Brave ships them)${RESET}"
+  [[ $unwritable -gt 0 ]] && echo "  Not written      : ${unwritable} ${DIM}(compiled out on this platform for good)${RESET}"
   [[ $failed  -gt 0 ]] && echo "  ${RED}Failed writes    : ${failed}${RESET}"
   [[ $JSON_FAILURES -gt 0 ]] && echo "  ${RED}Pref files failed: ${JSON_FAILURES}${RESET}"
   echo "  Receipt          : ${RECEIPT}"
@@ -998,6 +1618,165 @@ prior_noun() {
   else echo "a $1"; fi
 }
 
+# The macOS store is a shared domain an MDM also writes, so rollback is
+# key-by-key from the typed priors in the receipt. Counters live in
+# cmd_deactivate, whose `local` puts them in scope here.
+# The Linux store is one file this tool owns, shared by every channel, so
+# rollback is a refcount question and not a per-key one: the last channel out
+# puts the prior file back, and anyone earlier just leaves it alone.
+remove_policies_linux() {
+  local out kind rest
+  if [[ ! -f "$POLICY_REFCOUNT" ]]; then
+    if [[ ! -e "$POLICY_STORE" ]]; then
+      # Another channel's deactivate already took both the file and the record.
+      policy_outcome="already gone"
+      skip "policy file already gone: ${POLICY_STORE}"
+      return 0
+    fi
+    # The refcount is the handle, and it is gone. The marker outside managed/ is
+    # the only other evidence of whose file this is: when it names our store,
+    # removing it is the whole point of this command. When it does not, the file
+    # may belong to an MDM — leave it, and keep the receipt, or this exits 0
+    # having destroyed the last thing that could ever remove it.
+    # The receipt carries its own copy of the prior, so a lost policy-store
+    # record no longer means a lost prior — and a file we overwrote goes back
+    # instead of being deleted.
+    local rec_prior
+    rec_prior=$(RC="$RECEIPT" python3 -c '
+import json, os, sys
+rec = json.load(open(os.environ["RC"], encoding="utf-8"))
+sys.stdout.write(json.dumps(rec["policy_store_prior"]) if "policy_store_prior" in rec else "")
+' 2>/dev/null || true)
+    if [[ -n "$rec_prior" ]]; then
+      if [[ $DRY_RUN -eq 1 ]]; then
+        skip "would restore ${POLICY_STORE} from the receipt (the policy-store record is missing)"
+      elif PRIOR_JSON="$rec_prior" linux_policy_store restore-prior; then
+        rm -f "$POLICY_META"
+        ok "policy file put back from the receipt ${DIM}(the policy-store record was missing)${RESET}"
+        (( removed++ )) || true
+      else
+        fail "Could not restore ${POLICY_STORE} from the receipt."
+        (( pol_failed++ )) || true
+        policy_outcome="left in place (restore from the receipt failed)"
+        return 0
+      fi
+      policy_outcome="put back from the receipt (the policy-store record was missing)"
+      return 0
+    fi
+    if linux_policy_store meta-owns; then
+      if [[ $DRY_RUN -eq 1 ]]; then
+        skip "would remove ${POLICY_STORE} (no policy-store record; the marker says the file is ours)"
+      else
+        rm -f "$POLICY_STORE" "$POLICY_META" || {
+          fail "Could not remove ${POLICY_STORE}."
+          (( pol_failed++ )) || true
+          policy_outcome="left in place (removal failed)"
+          return 0
+        }
+        ok "policy file removed: ${POLICY_STORE} ${DIM}(no policy-store record; the marker identified it as ours)${RESET}"
+        (( removed++ )) || true
+      fi
+      policy_outcome="removed (the policy-store record was missing)"
+      return 0
+    fi
+    warn "No policy-store record at ${POLICY_REFCOUNT}, and nothing marks ${POLICY_STORE} as ours, so this cannot tell it from a file another tool wrote. Leaving it alone."
+    (( pol_failed++ )) || true
+    policy_outcome="left in place (no policy-store record)"
+    return 0
+  fi
+  local mode="release"; [[ $DRY_RUN -eq 1 ]] && mode="release-dry"
+  if ! out=$(linux_policy_store "$mode" "$BUNDLE_ID"); then
+    fail "Could not update ${POLICY_REFCOUNT}; ${POLICY_STORE} left as it is."
+    (( pol_failed++ )) || true
+    policy_outcome="left in place (the policy-store record could not be updated)"
+    return 0
+  fi
+  IFS=$'\t' read -r kind rest <<< "$out"
+  case "$kind" in
+    remaining)
+      policy_outcome="left in place — still active for ${rest}"
+      if [[ $DRY_RUN -eq 1 ]]; then skip "would leave ${POLICY_STORE}: ${rest} still active"
+      else info "${rest} still active — leaving ${POLICY_STORE} in place."; fi ;;
+    restored)
+      policy_outcome="restored to the file that was there before"
+      if [[ $DRY_RUN -eq 1 ]]; then skip "would restore the file that was there before: ${POLICY_STORE}"
+      else ok "restored the file that was there before: ${POLICY_STORE}"; (( restored++ )) || true; fi ;;
+    removed)
+      policy_outcome="removed"
+      if [[ $DRY_RUN -eq 1 ]]; then skip "would remove ${POLICY_STORE}"
+      else ok "policy file removed: ${POLICY_STORE}"; (( removed++ )) || true; fi ;;
+    *)
+      fail "Unexpected result from the policy store: ${out}"
+      (( pol_failed++ )) || true
+      policy_outcome="unknown" ;;
+  esac
+  return 0
+}
+
+remove_policies_macos() {
+  local store="$1"
+  local key ktype val
+  if [[ ! -f "$store" ]]; then
+    warn "Policy file already gone: ${store}"
+  elif ! plist_parses "$store"; then
+    err "${store} is not a valid plist. Refusing to modify or delete it."
+  else
+    while IFS= read -r -d '' key && IFS= read -r -d '' ktype && IFS= read -r -d '' val; do
+      [[ -z "$key" ]] && continue
+      if [[ $DRY_RUN -eq 1 ]]; then
+        if [[ "$ktype" == "absent" ]]; then
+          skip "would remove ${key}"
+        elif plist_type_is_restorable "$ktype"; then
+          skip "would restore ${key} = ${val} (${ktype})"
+        else
+          skip "would refuse ${key}: recorded prior is $(prior_noun "$ktype")"
+        fi
+        continue
+      fi
+      if [[ "$ktype" == "absent" ]]; then
+        if plist_delete_verified "$store" "$key"; then
+          ok "removed ${key}"; (( removed++ )) || true
+        else
+          fail "could not remove ${key}"; (( pol_failed++ )) || true
+        fi
+      elif plist_type_is_restorable "$ktype"; then
+        if plist_restore_verified "$store" "$key" "$ktype" "$val"; then
+          ok "restored ${key} = ${val} ${DIM}(pre-existing ${ktype})${RESET}"
+          (( restored++ )) || true
+        else
+          fail "could not restore ${key} = ${val} (${ktype})"; (( pol_failed++ )) || true
+        fi
+      else
+        # No substitute value gets written here: putting a dict back as a
+        # boolean destroys it, and reporting success would hide that.
+        fail "${key} — recorded prior is $(prior_noun "$ktype"); refusing to substitute a value. Left as it is."
+        (( pol_failed++ )) || true
+      fi
+    done < <(receipt_policy_records "$RECEIPT")
+
+    if [[ $DRY_RUN -eq 0 ]]; then
+      local left; left=$(plist_key_count "$store")
+      if [[ "$left" -eq 0 ]]; then
+        rm -f "$store"; ok "policy file removed (no keys left)"
+      else
+        # Distinguish keys we put back at their pre-existing values from keys
+        # that were never ours; calling both "not ours" reads like a failure.
+        local foreign=$(( left - restored ))
+        if [[ $restored -gt 0 && $foreign -gt 0 ]]; then
+          warn "${left} key(s) remain: ${restored} restored to pre-existing values, ${foreign} unrelated:"
+        elif [[ $restored -gt 0 ]]; then
+          warn "${left} key(s) remain, all restored to the values they had before this script ran:"
+        else
+          warn "${left} unrelated key(s) left untouched:"
+        fi
+        pb -c "Print" "$store" 2>/dev/null | grep " = " | sed 's/^/      /' || true
+      fi
+      finalize_policy_store
+    fi
+  fi
+  return 0
+}
+
 cmd_deactivate() {
   section "Brave Origin — deactivating"
   info "Target : ${CHANNEL_NAME} (${BUNDLE_ID})"
@@ -1030,15 +1809,18 @@ cmd_deactivate() {
   if [[ $DRY_RUN -eq 1 ]]; then
     skip "would restore prefs recorded in the receipt"
   else
-    as_user /usr/bin/env RC="$RECEIPT" python3 - <<'PY' || pref_failed=$?
+    # Passed by value, not by path: RECEIPT_DIR is 0700 root-owned, and this
+    # runs as the login user, who must not be able to open it.
+    local receipt_json
+    receipt_json=$(cat "$RECEIPT") || err "Could not read ${RECEIPT}."
+    as_user /usr/bin/env RCDATA="$receipt_json" python3 - <<'PY' || pref_failed=$?
 import json, os, sys, tempfile
 
 # Types a JSON pref can be put back as exactly. A dict or a list has no
 # faithful scalar substitute, so those are refused rather than approximated.
 RESTORABLE = {"boolean", "string", "number", "null"}
 
-with open(os.environ["RC"], encoding="utf-8") as fh:
-    rec = json.load(fh)
+rec = json.loads(os.environ["RCDATA"])
 
 def normalise(record):
     if isinstance(record, dict):                # typed record
@@ -1126,65 +1908,16 @@ PY
   fi
 
   section "Removing policies"
-  local removed=0 restored=0 pol_failed=0
-  local key ktype val
-  if [[ ! -f "$rec_plist" ]]; then
-    warn "Policy file already gone: ${rec_plist}"
-  elif ! plist_parses "$rec_plist"; then
-    err "${rec_plist} is not a valid plist. Refusing to modify or delete it."
+  local removed=0 restored=0 pol_failed=0 policy_outcome=""
+  if [[ "$PLATFORM" == "macos" ]]; then
+    remove_policies_macos "$rec_plist"
   else
-    while IFS= read -r -d '' key && IFS= read -r -d '' ktype && IFS= read -r -d '' val; do
-      [[ -z "$key" ]] && continue
-      if [[ $DRY_RUN -eq 1 ]]; then
-        if [[ "$ktype" == "absent" ]]; then
-          skip "would remove ${key}"
-        elif plist_type_is_restorable "$ktype"; then
-          skip "would restore ${key} = ${val} (${ktype})"
-        else
-          skip "would refuse ${key}: recorded prior is $(prior_noun "$ktype")"
-        fi
-        continue
-      fi
-      if [[ "$ktype" == "absent" ]]; then
-        if plist_delete_verified "$rec_plist" "$key"; then
-          ok "removed ${key}"; (( removed++ )) || true
-        else
-          fail "could not remove ${key}"; (( pol_failed++ )) || true
-        fi
-      elif plist_type_is_restorable "$ktype"; then
-        if plist_restore_verified "$rec_plist" "$key" "$ktype" "$val"; then
-          ok "restored ${key} = ${val} ${DIM}(pre-existing ${ktype})${RESET}"
-          (( restored++ )) || true
-        else
-          fail "could not restore ${key} = ${val} (${ktype})"; (( pol_failed++ )) || true
-        fi
-      else
-        # No substitute value gets written here: putting a dict back as a
-        # boolean destroys it, and reporting success would hide that.
-        fail "${key} — recorded prior is $(prior_noun "$ktype"); refusing to substitute a value. Left as it is."
-        (( pol_failed++ )) || true
-      fi
-    done < <(receipt_policy_records "$RECEIPT")
-
-    if [[ $DRY_RUN -eq 0 ]]; then
-      local left; left=$(plist_key_count "$rec_plist")
-      if [[ "$left" -eq 0 ]]; then
-        rm -f "$rec_plist"; ok "policy file removed (no keys left)"
-      else
-        # Distinguish keys we put back at their pre-existing values from keys
-        # that were never ours; calling both "not ours" reads like a failure.
-        local foreign=$(( left - restored ))
-        if [[ $restored -gt 0 && $foreign -gt 0 ]]; then
-          warn "${left} key(s) remain: ${restored} restored to pre-existing values, ${foreign} unrelated:"
-        elif [[ $restored -gt 0 ]]; then
-          warn "${left} key(s) remain, all restored to the values they had before this script ran:"
-        else
-          warn "${left} unrelated key(s) left untouched:"
-        fi
-        pb -c "Print" "$rec_plist" 2>/dev/null | grep " = " | sed 's/^/      /' || true
-      fi
-      killall cfprefsd 2>/dev/null || true
-    fi
+    # macOS acts on the path the receipt names; Linux acts on the globals. They
+    # must be the same file, or this would roll one receipt back against
+    # another's policy store.
+    [[ "$rec_plist" == "$POLICY_STORE" ]] || \
+      err "Receipt ${RECEIPT} records ${rec_plist}, but this run targets ${POLICY_STORE}. Refusing to act on a receipt for a different file."
+    remove_policies_linux
   fi
 
   # Outside the block above on purpose: an already-deleted plist is not a reason
@@ -1200,10 +1933,13 @@ PY
   # Other receipts this run did not touch: the other scope for this channel,
   # and any other channel.
   local other_note="" r
-  for r in "${RECEIPT_DIR}/${BUNDLE_ID}.user.json" "${RECEIPT_DIR}/${BUNDLE_ID}.machine.json"; do
-    [[ "$r" == "$RECEIPT" || ! -f "$r" ]] && continue
-    warn "Still active in the other scope: ${r} (re-run with the matching --machine)"
-  done
+  # Only macOS has two scopes to be out of step with each other.
+  if [[ "$PLATFORM" == "macos" ]]; then
+    for r in "${RECEIPT_DIR}/${BUNDLE_ID}.user.json" "${RECEIPT_DIR}/${BUNDLE_ID}.machine.json"; do
+      [[ "$r" == "$RECEIPT" || ! -f "$r" ]] && continue
+      warn "Still active in the other scope: ${r} (re-run with the matching --machine)"
+    done
+  fi
   for i in "${FOUND_IDX[@]}"; do
     [[ "${CH_ID[$i]}" == "$BUNDLE_ID" ]] && continue
     for r in "${RECEIPT_DIR}/${CH_ID[$i]}.user.json" \
@@ -1216,7 +1952,13 @@ PY
     warn "Still active on other channels (re-run with --channel):${other_note}"
 
   section "Result"
-  echo "  Policy keys      : ${removed} removed, ${restored} restored to prior values"
+  if [[ "$PLATFORM" == "macos" ]]; then
+    echo "  Policy keys      : ${removed} removed, ${restored} restored to prior values"
+  elif [[ $DRY_RUN -eq 1 ]]; then
+    echo "  Policy store     : would be ${policy_outcome}"
+  else
+    echo "  Policy store     : ${policy_outcome}"
+  fi
   [[ $pol_failed -gt 0 || $pref_failed -gt 0 ]] && \
     echo "  ${RED}Failures${RESET}         : ${pol_failed} polic(y/ies), ${pref_failed} pref file(s) — receipt kept"
   echo "  ${BOLD}Restart ${CHANNEL_NAME}.${RESET}"
@@ -1225,28 +1967,68 @@ PY
 }
 
 # ── STATUS ───────────────────────────────────────────────────────────────────
-cmd_status() {
-  section "Brave Origin — status"
-  local ver; ver=$(installed_version)
-  info "Target : ${CHANNEL_NAME} (${BUNDLE_ID}) ${ver}"
-  [[ "$ver" == "$VALIDATED_AGAINST" ]] || \
-    warn "Policy set last verified against ${VALIDATED_AGAINST}; this is ${ver}. Re-check for new Origin policies."
+# One store, one scope, and — because Brave merges every *.json in that
+# directory — a conflict report a macOS user has no equivalent of.
+status_policies_linux() {
+  section "Policies — ${POLICY_STORE} ${DIM}(machine scope, shared by every channel)${RESET}"
+  local active=0 missing=0 inert=0 entry key want cur effect colour report
+  if [[ ! -f "$POLICY_STORE" ]]; then
+    skip "file does not exist"
+  elif ! report=$(linux_policy_store report); then
+    fail "cannot read ${POLICY_STORE}"
+  else
+    if [[ -f "$POLICY_REFCOUNT" ]]; then
+      info "Activated for: $(policy_store_channels) ${DIM}(the file goes back only when the last one deactivates)${RESET}"
+    else
+      # The state nobody can get out of by re-running deactivate on a channel:
+      # the file is enforced, and the record of who asked for it is gone.
+      warn "This file is orphaned: no refcount at ${POLICY_REFCOUNT} records who activated it."
+      if linux_policy_store meta-owns; then
+        echo "      ${DIM}The marker says it is ours. ${SELF_CMD} deactivate --channel ${BUNDLE_ID} will remove it.${RESET}"
+      else
+        echo "      ${DIM}Nothing marks it as ours, so this will not touch it. Remove it by hand if you wrote it: rm ${POLICY_STORE}${RESET}"
+      fi
+    fi
+    printf "  %-30s %-8s %-9s %s\n" "KEY" "WANT" "IN FILE" "EFFECT"
+    for entry in "${POLICIES[@]}"; do
+      IFS="|" read -r key want _ <<< "$entry"
+      # The table follows POLICIES, not the file, so every key gets a row even
+      # when it is absent from the store.
+      cur=$(awk -F'\t' -v k="$key" '$1 == k { print $2 }' <<< "$report")
+      if ! is_supported "$key"; then
+        effect="inert ($(inert_reason "$key"))"; colour="$DIM"; (( inert++ )) || true
+      elif [[ "$cur" == "$want" ]]; then
+        effect="enforced"; colour="$GREEN"; (( active++ )) || true
+      else
+        effect="not applied"; colour="$RED"; (( missing++ )) || true
+      fi
+      printf "  ${colour}%-30s %-8s %-9s %s${RESET}\n" "$key" "$want" "$cur" "$effect"
+    done
+    echo "  ${DIM}enforced ${active} · not applied ${missing} · inert ${inert}${RESET}"
+  fi
 
-  probe_supported_keys
-  local managed="no"; device_is_managed && managed="yes"
+  # A file that sorts after ours in that directory silently overrides it, and
+  # nothing in Brave's UI says which file a value came from.
+  section "Other policy files in ${LINUX_MANAGED_DIR}"
+  local conflicts fname order keys
+  conflicts=$(linux_policy_store conflicts) || conflicts=""
+  if [[ -z "$conflicts" ]]; then
+    skip "no other file there sets any of these keys"
+  else
+    warn "Brave reads every *.json there in name order; the last file to set a key wins."
+    while IFS=$'\t' read -r fname order keys; do
+      [[ -z "$fname" ]] && continue
+      if [[ "$order" == "overrides" ]]; then
+        fail "${fname} sorts after ours and overrides: ${keys}"
+      else
+        info "${fname} sorts before ours, so ours wins: ${keys}"
+      fi
+    done <<< "$conflicts"
+  fi
+  return 0
+}
 
-  # Every receipt for this channel, both scopes and the pre-split name. One of
-  # them missing from this list is a plist nothing can roll back.
-  local r found_receipt=0
-  for r in "${RECEIPT_DIR}/${BUNDLE_ID}.user.json" \
-           "${RECEIPT_DIR}/${BUNDLE_ID}.machine.json" "$LEGACY_RECEIPT"; do
-    [[ -f "$r" ]] || continue
-    found_receipt=1
-    info "Receipt: ${r} ${DIM}($(receipt_summary "$r"))${RESET}"
-  done
-  [[ $found_receipt -eq 0 ]] && \
-    warn "No receipt — deactivate will refuse to run until activate creates one."
-
+status_policies_macos() {
   # Report BOTH scopes: a stale copy at the other path enforces policy silently.
   local p label
   for p in "$USER_PLIST" "$MACHINE_PLIST"; do
@@ -1283,6 +2065,33 @@ cmd_status() {
     done
     echo "  ${DIM}enforced ${active} · not applied ${missing} · inert ${inert}${RESET}"
   done
+  return 0
+}
+
+cmd_status() {
+  section "Brave Origin — status"
+  local ver; ver=$(installed_version)
+  info "Target : ${CHANNEL_NAME} (${BUNDLE_ID}) ${ver}"
+  [[ "$ver" == "$VALIDATED_AGAINST" ]] || \
+    warn "Policy set last verified against ${VALIDATED_AGAINST}; this is ${ver}. Re-check for new Origin policies."
+
+  probe_supported_keys
+  local managed="no"; device_is_managed && managed="yes"
+
+  # Every receipt for this channel, both scopes and the pre-split name. One of
+  # them missing from this list is a plist nothing can roll back.
+  local r found_receipt=0
+  for r in "${RECEIPT_DIR}/${BUNDLE_ID}.user.json" \
+           "${RECEIPT_DIR}/${BUNDLE_ID}.machine.json" "$LEGACY_RECEIPT"; do
+    [[ -f "$r" ]] || continue
+    found_receipt=1
+    info "Receipt: ${r} ${DIM}($(receipt_summary "$r"))${RESET}"
+  done
+  [[ $found_receipt -eq 0 ]] && \
+    warn "No receipt — deactivate will refuse to run until activate creates one."
+
+  if [[ "$PLATFORM" == "macos" ]]; then status_policies_macos
+  else                                  status_policies_linux; fi
 
   section "Profile prefs"
   # Same profile selection as the writer, or every run reports a false negative
@@ -1330,7 +2139,11 @@ PY
   done
 
   section "Environment"
-  echo "  Device managed : ${managed} ${DIM}(sensitive policies are blocked when 'no')${RESET}"
+  if [[ "$PLATFORM" == "macos" ]]; then
+    echo "  Device managed : ${managed} ${DIM}(sensitive policies are blocked when 'no')${RESET}"
+  else
+    echo "  Policy dir     : ${LINUX_MANAGED_DIR} ${DIM}(machine scope, no sensitive-policy filter on Linux)${RESET}"
+  fi
   echo "  ${CHANNEL_NAME} running : $(brave_running && echo yes || echo no)"
   echo
   echo "  ${DIM}This reads files, not the browser. brave://policy is authoritative.${RESET}"

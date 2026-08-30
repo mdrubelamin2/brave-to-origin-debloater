@@ -1,4 +1,4 @@
-# Brave to Origin — policy clone for standard Brave (macOS)
+# Brave to Origin — policy clone for standard Brave (macOS and Linux)
 
 Applies the 16 preferences that **Brave Origin upgrade mode** enforces, using Brave's
 own enterprise-policy mechanism, plus the standalone-build defaults reachable without
@@ -75,12 +75,14 @@ Verify at `brave://policy`.
 ### Tests
 
 ```bash
-./tests/run_tests.sh            # all 34
+./tests/run_tests.sh            # all 51
 ./tests/run_tests.sh receipt    # only tests whose name matches
 ```
 
-No `sudo`, no Brave install, nothing written outside `$TMPDIR`. See
-[Known limitations](#known-limitations) for what a sandboxed suite cannot reach.
+No `sudo`, no Brave install, nothing written outside `$TMPDIR`. The Linux backend is
+covered too: nine cases force the script onto its Linux paths with every system root
+redirected, so they run on macOS. See [Known limitations](#known-limitations) for what
+a sandboxed suite cannot reach.
 
 ---
 
@@ -283,7 +285,45 @@ Nightly is `Channel::CANARY` in `version_info`; there is no `NIGHTLY` enumerator
 
 ## How it works
 
-### Why the per-user path
+### Platforms
+
+| | Policy store | Scope | Nudge |
+|---|---|---|---|
+| macOS | `/Library/Managed Preferences/<user>/<bundle-id>.plist`, shared with every other tool | user, or machine with `--machine` | `killall cfprefsd` |
+| Linux | `/etc/brave/policies/managed/brave-to-origin.json`, a file of our own | machine only | none |
+
+The two backends differ more than the table suggests, and the difference is in our
+favour on Linux. macOS forces every tool into one shared plist, which is why the
+receipt has to record each key's prior value and type. Brave on Linux reads *every*
+`*.json` in `managed/`, so the tool writes its own file and `deactivate` removes it.
+Nothing else in that directory is ever touched.
+
+Two Linux consequences worth stating plainly:
+
+**Policies are global.** Every channel reads the same directory — there is no
+per-channel policy on Linux, and no user scope. `--machine` is accepted and ignored.
+So `activate` on stable also policies beta. Because deactivating one channel must not
+strip the policies another still wants, the policy file carries a list of the channels
+that asked for it, and it is only removed when the last one deactivates. `status`
+names the channels holding it.
+
+**Files sorting after ours override ours.** `managed/` is applied in lexicographic
+order, last file wins. `status` lists every other file there that sets any of our keys
+and says which way it sorts, because an MDM-deployed `zz-corp.json` silently beats us.
+
+`BraveVPNDisabled` is **compiled out on Linux** — `enable_brave_vpn_v1/v2` list
+`is_win || is_android || is_mac || is_ios`, with no `is_linux`. It is reported as
+not-written rather than applied, so 15 of 16 is the correct Linux result.
+
+**Snap is refused.** snapd's `browser_support` AppArmor profile whitelists
+`/etc/opt/chrome` and `/etc/chromium` and nothing else, so a snap Brave cannot read
+`/etc/brave` at all. Writing there would report success and change nothing.
+
+**Flatpak works**, because the manifest grants `--filesystem=host-etc` and its
+`brave.sh` symlinks the host's managed policies at launch — but only at launch, so
+restart Brave. Its profile lives at `~/.var/app/com.brave.Browser/config/BraveSoftware/`.
+
+### Why the per-user path (macOS)
 
 Policies go to `/Library/Managed Preferences/<user>/<bundle-id>.plist` by default.
 
@@ -300,8 +340,9 @@ unnoticed.
 
 ### Channels
 
-Bundle IDs from `app/theme/brave/BRANDING*` and `app/theme/brave_origin/BRANDING`;
-user-data directory names from `build/config.gni` (`brave_product_dir_name`).
+**macOS.** Bundle IDs from `app/theme/brave/BRANDING*` and
+`app/theme/brave_origin/BRANDING`; user-data directory names from `build/config.gni`
+(`brave_product_dir_name`).
 
 | Channel | Bundle ID | User-data directory |
 |---|---|---|
@@ -316,6 +357,19 @@ built with `GOOGLE_CHROME_BRANDING`, so each channel reads **its own** bundle ID
 
 Auto-detection prefers a real Brave over the Origin standalone build, since these
 policies are meaningless where the features are compiled out.
+
+**Linux.** There are no bundle IDs; the same strings are reused as channel names so
+`--channel` reads the same on both platforms. Detection is by binary path, and the
+profile directory has **no `User Data` component**.
+
+| Channel | Binary | Profile directory |
+|---|---|---|
+| Stable | `/opt/brave.com/brave/brave` | `~/.config/BraveSoftware/Brave-Browser` |
+| Beta | `/opt/brave.com/brave-beta/brave` | `~/.config/BraveSoftware/Brave-Browser-Beta` |
+| Nightly | `/opt/brave.com/brave-nightly/brave` | `~/.config/BraveSoftware/Brave-Browser-Nightly` |
+
+`$XDG_CONFIG_HOME` is honoured when set. Brave ships **no dev channel on Linux**, and
+the version is read from `dpkg-query` or `rpm -q` rather than by launching anything.
 
 > Brave's own docs write `com.brave.browser` in prose but `com.brave.Browser` in their
 > commands. Preference domains are case-sensitive; `BRANDING` confirms the capital **B**.
@@ -370,6 +424,13 @@ Claims in earlier versions of this document that source review disproved:
 
 ## Known limitations
 
+**Linux is verified by source and sandbox, not on a Linux machine.** Every path,
+directory and package name above was read from brave-core at `v1.94.117` and from the
+shipped `.deb` file lists, and the backend is exercised by the test suite — but no run
+against a real Linux Brave has happened yet. The parts most worth confirming there:
+that Brave picks the file up without a restart, that snap really is blocked, and that
+Flatpak really does link the host policies in.
+
 **Reboot persistence is untested.** There are community reports that `mdmclient` removes
 raw plists from `/Library/Managed Preferences` at boot unless they arrive via a signed
 configuration profile. Not reproduced here. If policies vanish after a restart, package
@@ -388,7 +449,7 @@ remains authoritative.
 `152.1.94.117`; `status` warns when the installed version differs, since Brave may have
 added Origin policies since.
 
-**The tests do not run as root.** `./tests/run_tests.sh` covers 34 cases — the
+**The tests do not run as root.** `./tests/run_tests.sh` covers 51 cases — the
 activate/deactivate round trip, typed restores, the earliest-prior merge, scope
 separation, receipt refusals, dry runs, an interrupted `activate`, and the installer's
 checksum gate — against sandboxed copies of both scripts in a temp directory. It needs no `sudo`, no Brave install

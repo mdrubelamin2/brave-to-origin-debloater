@@ -7,8 +7,8 @@
 #
 # Fetches origin.sh at a pinned tag, verifies its SHA-256, and runs it. Nothing
 # is left behind: the script is downloaded to a temp file and deleted after.
-# The receipt it writes lives in /Library/Application Support, so a later
-# `deactivate` works without any of this being installed.
+# The receipt it writes lives outside all of this — /Library/Application Support
+# on macOS, /var/lib on Linux — so a later `deactivate` needs none of it.
 #
 # Non-interactive form, for scripts and CI:
 #   ... | sudo bash -s -- activate
@@ -25,8 +25,8 @@ set -euo pipefail
 REPO="mdrubelamin2/brave-to-origin"
 # Pinned, not a moving branch: piping a URL to root should not mean "whatever
 # that branch says today". Bump both together when cutting a release.
-PINNED_REF="v1.0.2"
-PINNED_SHA256="834f91df8007542585802c015fdbfc3a85752f9d5864b07f176e59d30e96cf4b"
+PINNED_REF="v1.1.0"
+PINNED_SHA256="0760d69f427029b04a7a9518bb6407918768b7d91320493d34138977787a6880"
 
 REF="${ORIGIN_REF:-$PINNED_REF}"
 EXPECTED_SHA="${ORIGIN_SHA256:-$PINNED_SHA256}"
@@ -46,12 +46,22 @@ err()  { echo "${RED}[x]${RESET} $*" >&2; exit 1; }
 CURL_CMD="curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh | sudo bash"
 
 # ── Guards ───────────────────────────────────────────────────────────────────
-[[ "$(uname -s)" == "Darwin" ]] || err "This is macOS-only. Brave's policy path
-    (/Library/Managed Preferences) and PlistBuddy do not exist on $(uname -s)."
+# The two desktop platforms whose policy store is a file. Windows keeps its in
+# the registry, which neither this nor origin.sh writes.
+case "$(uname -s)" in
+  Darwin) PLATFORM="macos" ;;
+  Linux)  PLATFORM="linux" ;;
+  *) err "Unsupported platform: $(uname -s). This supports macOS and Linux." ;;
+esac
+
+# Snap confines Brave with an AppArmor profile whose browser_support abstraction
+# whitelists only /etc/opt/chrome and /etc/chromium, so a policy file under
+# /etc/brave would be written successfully and then never read.
+SNAP_BRAVE="/snap/brave/current/opt/brave.com/brave/brave"
 
 # Piping to `bash` rather than `sudo bash` is the likeliest mistake, and it
 # fails deep inside origin.sh rather than here, so catch it up front.
-[[ "$EUID" -eq 0 ]] || err "Needs root, because policies live under /Library.
+[[ "$EUID" -eq 0 ]] || err "Needs root: the policy store is under /Library on macOS, /etc on Linux.
     Re-run as: ${CURL_CMD}"
 
 # sudo exports SUDO_USER; without it there is no way to know whose profile and
@@ -61,7 +71,15 @@ CURL_CMD="curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh |
     ${CURL_CMD}"
 
 command -v curl >/dev/null 2>&1 || err "curl not found."
-command -v shasum >/dev/null 2>&1 || err "shasum not found."
+# coreutils ships sha256sum and a minimal Fedora, Arch or Alpine has no shasum
+# at all; macOS is the other way round. Pick whichever is here, once.
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256_of() { sha256sum "$1" | cut -d' ' -f1; }
+elif command -v shasum >/dev/null 2>&1; then
+  sha256_of() { shasum -a 256 "$1" | cut -d' ' -f1; }
+else
+  err "Neither sha256sum nor shasum found; cannot verify the download."
+fi
 
 echo
 echo "${BOLD}Brave to Origin${RESET} ${DIM}— ${REPO} @ ${REF}${RESET}"
@@ -77,17 +95,69 @@ CH_APP=("/Applications/Brave Browser.app" "/Applications/Brave Browser Beta.app"
         "/Applications/Brave Origin.app")
 CH_ID=("com.brave.Browser" "com.brave.Browser.beta" "com.brave.Browser.nightly" \
        "com.brave.Browser.dev" "com.brave.Browser.origin")
+CH_PKG=("" "" "" "" "")
+
+# Linux ships no dev channel and no Origin standalone. The IDs are reused as
+# channel names so --channel reads the same on both platforms.
+if [[ "$PLATFORM" == "linux" ]]; then
+  CH_NAME=("Brave (stable)" "Brave Beta" "Brave Nightly")
+  CH_APP=("/opt/brave.com/brave/brave" "/opt/brave.com/brave-beta/brave" \
+          "/opt/brave.com/brave-nightly/brave")
+  CH_ID=("com.brave.Browser" "com.brave.Browser.beta" "com.brave.Browser.nightly")
+  CH_PKG=("brave-browser" "brave-browser-beta" "brave-browser-nightly")
+  # Flatpak reaches the host's /etc/brave policies (--filesystem=host-etc, and
+  # brave.sh symlinks them at launch), so it is a supported target.
+  # $HOME is root's under sudo; the per-user Flatpak install is under the
+  # invoking user's home, which the password database is the only honest source
+  # for.
+  # `|| true`: getent is absent from minimal containers, and exits 2 when the
+  # user is unknown. Under `set -e` either would abort the installer silently;
+  # the default below is already the answer for "no home found".
+  USER_HOME=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true)
+  for fp in "/var/lib/flatpak/app/com.brave.Browser" \
+            "${USER_HOME:-/nonexistent}/.local/share/flatpak/app/com.brave.Browser"; do
+    [[ -d "$fp" ]] || continue
+    CH_NAME+=("Brave (Flatpak)"); CH_APP+=("$fp")
+    CH_ID+=("com.brave.Browser.flatpak"); CH_PKG+=("")
+    break
+  done
+fi
 
 FOUND_IDX=()
 for i in "${!CH_APP[@]}"; do
-  [[ -d "${CH_APP[$i]}" ]] && FOUND_IDX+=("$i")
+  [[ -e "${CH_APP[$i]}" ]] && FOUND_IDX+=("$i")
 done
-[[ ${#FOUND_IDX[@]} -gt 0 ]] || err "No Brave install found in /Applications."
+if [[ ${#FOUND_IDX[@]} -eq 0 ]]; then
+  [[ "$PLATFORM" == "macos" ]] && err "No Brave install found in /Applications."
+  [[ -e "$SNAP_BRAVE" ]] && err "Only the snap build of Brave is installed, and policies cannot reach it.
+    Its AppArmor profile allows reading policies from /etc/opt/chrome and
+    /etc/chromium only, so anything written to /etc/brave/policies would be
+    ignored. Install the .deb/.rpm from brave.com, or the Flatpak, and re-run."
+  err "No Brave install found under /opt/brave.com."
+fi
+[[ "$PLATFORM" == "linux" && -e "$SNAP_BRAVE" ]] && \
+  warn "A snap Brave is also installed. Policies cannot reach it."
 
 app_version() {
   local v
-  v=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" \
-        "${1}/Contents/Info.plist" 2>/dev/null) || v=""
+  if [[ "$PLATFORM" == "macos" ]]; then
+    v=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" \
+          "${1}/Contents/Info.plist" 2>/dev/null) || v=""
+  else
+    # Same order origin.sh uses: package database first, the binary second.
+    # A Debian version carries an epoch and a revision Brave's own does not.
+    v=""
+    if [[ -n "$2" ]] && command -v dpkg-query >/dev/null 2>&1; then
+      v=$(dpkg-query -W -f='${Version}' "$2" 2>/dev/null || true)
+      v="${v#*:}"; v="${v%%-*}"
+    fi
+    if [[ -z "$v" && -n "$2" ]] && command -v rpm >/dev/null 2>&1; then
+      v=$(rpm -q --qf '%{VERSION}' "$2" 2>/dev/null || true)
+    fi
+    if [[ -z "$v" && -f "$1" && -x "$1" ]]; then
+      v=$(sudo -u "$SUDO_USER" "$1" --product-version 2>/dev/null || true)
+    fi
+  fi
   # PlistBuddy reports a missing file on stdout, not stderr, so an unfiltered
   # fallback prints its error as if it were the version.
   [[ "$v" =~ ^[0-9]+(\.[0-9]+)*$ ]] && echo "$v" || echo "unknown"
@@ -95,7 +165,7 @@ app_version() {
 
 echo "${BOLD}Installed:${RESET}"
 for i in "${FOUND_IDX[@]}"; do
-  printf '  %-26s %s\n' "${CH_NAME[$i]}" "$(app_version "${CH_APP[$i]}")"
+  printf '  %-26s %s\n' "${CH_NAME[$i]}" "$(app_version "${CH_APP[$i]}" "${CH_PKG[$i]}")"
 done
 echo
 
@@ -175,7 +245,7 @@ else
     || err "Download failed: ${SOURCE}"
 fi
 
-ACTUAL_SHA=$(shasum -a 256 "$SCRIPT" | cut -d' ' -f1)
+ACTUAL_SHA=$(sha256_of "$SCRIPT")
 # Anything that is not 64 hex characters is not a checksum: an unreplaced
 # placeholder, an empty value, or an explicit "skip". Matching on the literal
 # placeholder text would be fragile — a release script that rewrites it

@@ -102,3 +102,61 @@ PY
   bash -n "$out" || { echo "sandboxed installer has a syntax error" >&2; return 1; }
   echo "$out"
 }
+
+# Builds a LINUX sandbox: the same script, forced onto its Linux code paths,
+# with every system root redirected into the sandbox. Runs on macOS, which is
+# the point — the Linux backend is testable without a Linux box.
+# sandbox_build_linux <sandbox-dir> -> path of the runnable script
+sandbox_build_linux() {
+  local sbx="$1" src
+  src="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/origin.sh"
+
+  local home="${sbx}/home/tester"
+  mkdir -p "${sbx}/etc/brave/policies/managed" "${sbx}/var/lib/brave-to-origin"
+  mkdir -p "${home}/.config/BraveSoftware/Brave-Browser/Default"
+  mkdir -p "${home}/.config/BraveSoftware/Brave-Browser-Beta/Default"
+  # Stand-in ELFs. The capability probe greps them for policy names, so writing
+  # the names in makes every policy report as supported.
+  local b
+  for b in brave brave-beta brave-nightly; do
+    mkdir -p "${sbx}/opt/brave.com/${b}"
+    grep -o '"Brave[A-Za-z]*|[a-z]*|[a-z]*"' "$src" | cut -d'"' -f2 | cut -d'|' -f1 \
+      > "${sbx}/opt/brave.com/${b}/brave"
+    echo "TorDisabled" >> "${sbx}/opt/brave.com/${b}/brave"
+    chmod +x "${sbx}/opt/brave.com/${b}/brave"
+  done
+
+  local out="${sbx}/origin-linux.sh"
+  SBX="$sbx" python3 - "$src" "$out" <<'PY'
+import os, re, sys
+sbx = os.environ["SBX"]
+src, out = sys.argv[1], sys.argv[2]
+s = open(src, encoding="utf-8").read()
+
+def sub(pattern, repl, why):
+    global s
+    s, n = re.subn(pattern, repl, s, count=1, flags=re.M)
+    assert n == 1, f"linux sandbox seam not found ({why}): {pattern}"
+
+sub(r'^PLATFORM="\$\(uname -s\)"$', 'PLATFORM="linux"', "platform")
+sub(r'^LINUX_POLICY_ROOT="/etc/brave/policies"$',
+    f'LINUX_POLICY_ROOT="{sbx}/etc/brave/policies"', "policy root")
+sub(r'^LINUX_RECEIPT_DIR="/var/lib/brave-to-origin"$',
+    f'LINUX_RECEIPT_DIR="{sbx}/var/lib/brave-to-origin"', "receipt dir")
+sub(r'^\[\[ "\$EUID" -ne 0 \]\] && err .*$', ': # sandbox', "euid guard")
+sub(r'^TARGET_USER=.*$', 'TARGET_USER="tester"', "target user")
+sub(r'^TARGET_HOME=\$\(TU="\$TARGET_USER" python3 -c \\\n.*$',
+    f'TARGET_HOME="{sbx}/home/tester"', "home dir")
+sub(r'^as_user\(\) \{ sudo -u "\$TARGET_USER" "\$@"; \}$', 'as_user() { "$@"; }', "as_user")
+sub(r'^brave_running\(\) \{.*$',
+    'brave_running() { [[ -n "${SBX_BRAVE_RUNNING:-}" ]]; }', "brave_running")
+s = s.replace('"/opt/brave.com/', f'"{sbx}/opt/brave.com/')
+s = s.replace('SNAP_BRAVE="', f'SNAP_BRAVE="{sbx}')
+s = re.sub(r'^(\s*)chown root:wheel', r'\1chown "$(id -un)" 2>/dev/null || true; : ', s, flags=re.M)
+s = re.sub(r'^(\s*)chown root:root', r'\1chown "$(id -un)" 2>/dev/null || true; : ', s, flags=re.M)
+open(out, "w", encoding="utf-8").write(s)
+PY
+  chmod +x "$out"
+  bash -n "$out" || { echo "linux sandbox copy has a syntax error" >&2; return 1; }
+  echo "$out"
+}

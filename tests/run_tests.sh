@@ -370,6 +370,254 @@ t_result_summarises_prefs() {
   esac
 }
 
+# ── Linux backend ────────────────────────────────────────────────────────────
+# Forced onto the Linux code paths with every system root redirected into the
+# sandbox, so these run on macOS. See sandbox_build_linux in sandbox.sh.
+
+LSCRIPT=""; LSTORE=""; LMETA=""; LPREFS=""; LPREFS_BETA=""; LLOCAL=""; LRECEIPTS=""
+lsetup() {
+  SBX=$(mktemp -d)
+  LSCRIPT=$(sandbox_build_linux "$SBX")
+  LSTORE="${SBX}/etc/brave/policies/managed/brave-to-origin.json"
+  LMETA="${SBX}/etc/brave/policies/brave-to-origin.meta.json"
+  LRECEIPTS="${SBX}/var/lib/brave-to-origin"
+  local c="${SBX}/home/tester/.config/BraveSoftware"
+  LPREFS="${c}/Brave-Browser/Default/Preferences"
+  LPREFS_BETA="${c}/Brave-Browser-Beta/Default/Preferences"
+  LLOCAL="${c}/Brave-Browser/Local State"
+  sandbox_json "$LPREFS" '{"brave":{"other":1}}'
+  sandbox_json "$LPREFS_BETA" '{"brave":{"other":2}}'
+  sandbox_json "$LLOCAL" '{"user_experience_metrics":{"reporting_enabled":true}}'
+  sandbox_json "${c}/Brave-Browser-Beta/Local State" '{}'
+}
+lrun()   { bash "$LSCRIPT" "$@" --no-color; }
+lrun_q() { lrun "$@" >/dev/null 2>&1; }
+store_has() { python3 -c '
+import json,os,sys
+d=json.load(open(os.environ["F"]))
+print("yes" if os.environ["K"] in d else "no")' ; }
+
+t_linux_activate_writes_store() {
+  lsetup
+  lrun_q activate
+  assert_file_exists "$LSTORE" || return 1
+  local keys; keys=$(F="$LSTORE" python3 -c 'import json,os;print(len(json.load(open(os.environ["F"]))))')
+  # 16 policies minus BraveVPNDisabled, which is compiled out on Linux.
+  assert "policy count" "$keys" "15" || return 1
+  assert "VPN excluded" "$(F="$LSTORE" K=BraveVPNDisabled store_has)" "no" || return 1
+  assert "Tor present"  "$(F="$LSTORE" K=TorDisabled store_has)" "yes" || return 1
+}
+
+# Brave reports any unrecognised key in managed/ as a bad policy, so the
+# "this file is ours" marker must live outside the file Brave reads.
+t_linux_store_has_no_foreign_keys() {
+  lsetup
+  lrun_q activate
+  local bad; bad=$(F="$LSTORE" python3 -c '
+import json,os
+d=json.load(open(os.environ["F"]))
+print(",".join(k for k in d if not k[0].isupper()))')
+  assert "no non-policy keys in the store" "$bad" "" || return 1
+  assert_file_exists "$LMETA" || return 1
+}
+
+t_linux_roundtrip_restores_exactly() {
+  lsetup
+  local a b; a=$(sha "$LPREFS"); b=$(sha "$LLOCAL")
+  lrun_q activate
+  lrun_q deactivate
+  assert_file_absent "$LSTORE" || return 1
+  assert "Preferences byte-identical" "$(sha "$LPREFS")" "$a" || return 1
+  assert "Local State byte-identical" "$(sha "$LLOCAL")" "$b" || return 1
+}
+
+# Linux policy is global: every channel reads the same directory. Deactivating
+# one channel must not strip the policies another channel still wants.
+t_linux_refcount_holds_store_for_other_channel() {
+  lsetup
+  lrun_q activate --channel com.brave.Browser
+  lrun_q activate --channel com.brave.Browser.beta
+  lrun_q deactivate --channel com.brave.Browser
+  assert_file_exists "$LSTORE" || return 1
+  lrun_q deactivate --channel com.brave.Browser.beta
+  assert_file_absent "$LSTORE" || return 1
+}
+
+# A policy file that was already there belongs to someone else.
+t_linux_preexisting_store_restored() {
+  lsetup
+  printf '%s' '{"SomeOtherPolicy": true}' > "$LSTORE"
+  local before; before=$(sha "$LSTORE")
+  lrun_q activate
+  assert "ours now" "$(F="$LSTORE" K=TorDisabled store_has)" "yes" || return 1
+  lrun_q deactivate
+  assert_file_exists "$LSTORE" || return 1
+  assert "prior file restored byte-for-byte" "$(sha "$LSTORE")" "$before" || return 1
+}
+
+# managed/ is applied in lexicographic order and the last file wins, so a file
+# sorting after ours silently overrides it. status must say so.
+t_linux_status_reports_overriding_file() {
+  lsetup
+  lrun_q activate
+  printf '%s' '{"TorDisabled": false}' > "${SBX}/etc/brave/policies/managed/zz-corp.json"
+  printf '%s' '{"TorDisabled": false}' > "${SBX}/etc/brave/policies/managed/aa-corp.json"
+  local out; out=$(lrun status 2>&1)
+  # Both files touch TorDisabled; only the later-sorting one actually wins, and
+  # the report has to distinguish them rather than just listing both.
+  case "$out" in *"zz-corp.json sorts after"*) : ;;
+    *) _fail_msg+="      status did not flag zz-corp.json as overriding"$'\n'; return 1 ;;
+  esac
+  case "$out" in *"aa-corp.json sorts before"*) : ;;
+    *) _fail_msg+="      status did not report aa-corp.json as harmless"$'\n'; return 1 ;;
+  esac
+}
+
+# The Linux profile path has no "User Data" component, unlike macOS/Windows.
+t_linux_profile_path_has_no_user_data() {
+  lsetup
+  lrun_q activate
+  assert "pref written to the XDG path" \
+    "$(json_get "$LPREFS" brave.show_side_panel_button)" "false" || return 1
+  [[ -e "${SBX}/home/tester/.config/BraveSoftware/Brave-Browser/User Data" ]] && {
+    _fail_msg+="      created a User Data directory, which Linux does not use"$'\n'; return 1; }
+  return 0
+}
+
+t_linux_dry_run_writes_nothing() {
+  lsetup
+  local before; before=$(sha "$LPREFS")
+  lrun_q activate --dry-run
+  assert_file_absent "$LSTORE" || return 1
+  assert "prefs untouched" "$(sha "$LPREFS")" "$before" || return 1
+  [[ -z "$(ls -A "$LRECEIPTS" 2>/dev/null)" ]] || {
+    _fail_msg+="      dry run wrote a receipt"$'\n'; return 1; }
+}
+
+t_linux_deactivate_without_receipt_refuses() {
+  lsetup
+  lrun_q activate
+  rm -f "$LRECEIPTS"/*.json
+  lrun_q deactivate
+  assert "exits non-zero" "$?" "1" || return 1
+  assert_file_exists "$LSTORE" || return 1
+}
+
+# Linux policies are global and the refcount is the only handle on the shared
+# file. These are the states where that handle can be lost.
+
+# If the refcount file disappears, the next activate must not mistake OUR file
+# for a third party's prior, and no deactivation may report success while
+# leaving the file behind with nothing able to remove it.
+t_linux_lost_refcount_does_not_orphan() {
+  lsetup
+  lrun_q activate --channel com.brave.Browser
+  rm -f "${LRECEIPTS}/policy-store.json"
+  lrun_q activate --channel com.brave.Browser.beta
+  lrun_q deactivate --channel com.brave.Browser.beta
+  lrun_q deactivate --channel com.brave.Browser
+  # Either the file is gone, or a receipt survives that can still remove it.
+  if [[ -e "$LSTORE" ]]; then
+    [[ -n "$(ls -A "$LRECEIPTS" 2>/dev/null)" ]] || {
+      _fail_msg+="      policy file orphaned: still present, no receipt can remove it"$'\n'
+      return 1; }
+  fi
+}
+
+# Uninstalling a channel must not strand its refcount entry, or the shared file
+# can never be released.
+t_linux_uninstalled_channel_can_deactivate() {
+  lsetup
+  lrun_q activate --channel com.brave.Browser
+  lrun_q activate --channel com.brave.Browser.beta
+  rm -rf "${SBX}/opt/brave.com/brave-beta"
+  lrun_q deactivate --channel com.brave.Browser.beta
+  assert "deactivate of an uninstalled channel succeeds" "$?" "0" || return 1
+  lrun_q deactivate --channel com.brave.Browser
+  assert_file_absent "$LSTORE" || return 1
+}
+
+# A hand-edited refcount must not wedge every future deactivation.
+t_linux_corrupt_refcount_does_not_wedge() {
+  lsetup
+  lrun_q activate
+  printf '%s' '{"prior":{"state":"absent"},"channels":["com.brave.Browser",null]}' \
+    > "${LRECEIPTS}/policy-store.json"
+  local out; out=$(lrun deactivate 2>&1)
+  case "$out" in *Traceback*)
+    _fail_msg+="      a Python traceback reached the user"$'\n'; return 1 ;;
+  esac
+  # It may refuse, but it must keep the receipt so recovery is possible.
+  if [[ -e "$LSTORE" ]]; then
+    [[ -n "$(ls -A "$LRECEIPTS" 2>/dev/null)" ]] || {
+      _fail_msg+="      wedged: store kept but every handle discarded"$'\n'; return 1; }
+  fi
+}
+
+t_linux_corrupt_refcount_shows_no_traceback() {
+  lsetup
+  lrun_q activate
+  printf '%s' 'not json at all' > "${LRECEIPTS}/policy-store.json"
+  local out; out=$(lrun deactivate 2>&1; lrun status 2>&1)
+  case "$out" in *Traceback*)
+    _fail_msg+="      a Python traceback reached the user"$'\n'; return 1 ;;
+  esac
+}
+
+# A prior file's mode is part of its state. Restoring 0600 as 0644 widens a
+# file someone deliberately tightened.
+t_linux_prior_store_mode_restored() {
+  lsetup
+  printf '%s' '{"SomeOtherPolicy": true}' > "$LSTORE"
+  chmod 600 "$LSTORE"
+  lrun_q activate
+  lrun_q deactivate
+  assert_file_exists "$LSTORE" || return 1
+  local mode; mode=$(stat -f '%Lp' "$LSTORE" 2>/dev/null || stat -c '%a' "$LSTORE")
+  assert "prior mode restored" "$mode" "600" || return 1
+}
+
+# The one place a stuck user looks.
+t_linux_status_flags_orphaned_store() {
+  lsetup
+  lrun_q activate
+  rm -f "${LRECEIPTS}/policy-store.json"
+  local out; out=$(lrun status 2>&1)
+  case "$out" in *orphan*|*"no refcount"*|*"no record"*) : ;;
+    *) _fail_msg+="      status says nothing about a store with no refcount"$'\n'; return 1 ;;
+  esac
+}
+
+# Snap cannot read /etc/brave at all, so writing there would report success and
+# change nothing.
+t_linux_snap_only_is_refused() {
+  lsetup
+  rm -rf "${SBX}/opt/brave.com"
+  mkdir -p "${SBX}/snap/brave/current/opt/brave.com/brave"
+  echo x > "${SBX}/snap/brave/current/opt/brave.com/brave/brave"
+  chmod +x "${SBX}/snap/brave/current/opt/brave.com/brave/brave"
+  local out; out=$(lrun activate 2>&1)
+  assert "exits non-zero" "$?" "1" || return 1
+  assert_file_absent "$LSTORE" || return 1
+  case "$out" in *[Ss]nap*) : ;;
+    *) _fail_msg+="      refusal did not mention snap"$'\n'; return 1 ;;
+  esac
+}
+
+# The whole point of the receipt is that a file we did not create comes back.
+# The policy-file prior must therefore survive the loss of any single record,
+# or a lost refcount silently destroys an MDM-deployed policy file.
+t_linux_foreign_store_survives_lost_refcount() {
+  lsetup
+  printf '%s' '{"SomeCorpPolicy": true}' > "$LSTORE"
+  local before; before=$(sha "$LSTORE")
+  lrun_q activate
+  rm -f "${LRECEIPTS}/policy-store.json"
+  lrun_q deactivate
+  assert_file_exists "$LSTORE" || return 1
+  assert "corp policy file restored, not deleted" "$(sha "$LSTORE")" "$before" || return 1
+}
+
 # ── install.sh ───────────────────────────────────────────────────────────────
 # The bootstrap the curl one-liner runs. Sandboxed the same way: only the two
 # root preconditions and the /Applications lookup are rewritten.
@@ -488,6 +736,24 @@ test_case "status runs clean before and after"         t_status_runs_clean_befor
 test_case "unreadable prefs keeps the receipt"         t_unreadable_prefs_keeps_receipt
 test_case "pref progress goes to stdout"               t_pref_progress_goes_to_stdout
 test_case "result block summarises prefs"              t_result_summarises_prefs
+
+test_case "linux: activate writes the policy store"     t_linux_activate_writes_store
+test_case "linux: store carries no foreign keys"        t_linux_store_has_no_foreign_keys
+test_case "linux: roundtrip restores exactly"           t_linux_roundtrip_restores_exactly
+test_case "linux: refcount holds store for other channel" t_linux_refcount_holds_store_for_other_channel
+test_case "linux: pre-existing store is restored"       t_linux_preexisting_store_restored
+test_case "linux: status reports an overriding file"    t_linux_status_reports_overriding_file
+test_case "linux: profile path has no User Data"        t_linux_profile_path_has_no_user_data
+test_case "linux: dry run writes nothing"               t_linux_dry_run_writes_nothing
+test_case "linux: deactivate without receipt refuses"   t_linux_deactivate_without_receipt_refuses
+test_case "linux: lost refcount does not orphan"        t_linux_lost_refcount_does_not_orphan
+test_case "linux: uninstalled channel can deactivate"  t_linux_uninstalled_channel_can_deactivate
+test_case "linux: corrupt refcount does not wedge"     t_linux_corrupt_refcount_does_not_wedge
+test_case "linux: corrupt refcount shows no traceback" t_linux_corrupt_refcount_shows_no_traceback
+test_case "linux: prior store mode is restored"        t_linux_prior_store_mode_restored
+test_case "linux: status flags an orphaned store"      t_linux_status_flags_orphaned_store
+test_case "linux: snap-only install is refused"        t_linux_snap_only_is_refused
+test_case "linux: foreign store survives lost refcount" t_linux_foreign_store_survives_lost_refcount
 test_case "status works with only a Default profile"    t_status_with_only_default_profile
 test_case "activate works with only a Default profile"  t_activate_with_only_default_profile
 test_case "corrupt prior receipt refuses activate"     t_corrupt_prior_receipt_refuses_activate
