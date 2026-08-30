@@ -414,6 +414,28 @@ t_installer_lists_installed_channels() {
   esac
 }
 
+# The pinned checksum must actually be checked. An earlier release pinned the
+# real value into the "is it still a placeholder?" comparison as well, which
+# silently disabled verification while still looking pinned.
+t_installer_pinned_sha_is_enforced() {
+  local pinned out
+  pinned=$(grep '^PINNED_SHA256=' install.sh | cut -d'"' -f2)
+  case "$pinned" in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) : ;;
+    *) _fail_msg+="      PINNED_SHA256 is not a checksum: [$pinned]"$'\n'; return 1 ;;
+  esac
+  assert "pinned sha is 64 hex chars" "${#pinned}" "64" || return 1
+  # Feeding it a file whose checksum is the pinned one must verify, not warn.
+  out=$(ORIGIN_SOURCE="$SCRIPT" ORIGIN_SHA256="$(shasum -a 256 "$SCRIPT" | cut -d' ' -f1)" installer status)
+  case "$out" in
+    *"Checksum verified"*) : ;;
+    *) _fail_msg+="      a matching checksum did not report as verified"$'\n'; return 1 ;;
+  esac
+  case "$out" in
+    *"not verified"*) _fail_msg+="      verification was skipped, not performed"$'\n'; return 1 ;;
+  esac
+}
+
 # ── Run ──────────────────────────────────────────────────────────────────────
 echo "origin.sh test suite"
 echo "${DIM}sandboxed: no root, no real Brave, nothing written outside \$TMPDIR${RESET}"
@@ -451,6 +473,7 @@ test_case "installer passes the action through"        t_installer_passes_action
 test_case "installer prints a pasteable rollback"      t_installer_reports_rollback_command
 test_case "installer without tty or action explains"   t_installer_without_tty_or_action_explains
 test_case "installer lists installed channels"         t_installer_lists_installed_channels
+test_case "installer enforces the pinned checksum"     t_installer_pinned_sha_is_enforced
 
 echo
 if (( FAIL == 0 )); then

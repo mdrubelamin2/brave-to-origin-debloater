@@ -75,7 +75,7 @@ Verify at `brave://policy`.
 ### Tests
 
 ```bash
-./tests/run_tests.sh            # all 31
+./tests/run_tests.sh            # all 32
 ./tests/run_tests.sh receipt    # only tests whose name matches
 ```
 
@@ -388,7 +388,7 @@ remains authoritative.
 `152.1.94.117`; `status` warns when the installed version differs, since Brave may have
 added Origin policies since.
 
-**The tests do not run as root.** `./tests/run_tests.sh` covers 31 cases — the
+**The tests do not run as root.** `./tests/run_tests.sh` covers 32 cases — the
 activate/deactivate round trip, typed restores, the earliest-prior merge, scope
 separation, receipt refusals, dry runs, an interrupted `activate`, and the installer's
 checksum gate — against sandboxed copies of both scripts in a temp directory. It needs no `sudo`, no Brave install

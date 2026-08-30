@@ -25,7 +25,7 @@ set -euo pipefail
 REPO="mdrubelamin2/brave-to-origin"
 # Pinned, not a moving branch: piping a URL to root should not mean "whatever
 # that branch says today". Bump both together when cutting a release.
-PINNED_REF="v1.0.0"
+PINNED_REF="v1.0.1"
 PINNED_SHA256="dfb35a17bcb34617893e664a722715ee3e5ad21a8af78422f3df495a6fcb8b3d"
 
 REF="${ORIGIN_REF:-$PINNED_REF}"
@@ -176,7 +176,11 @@ else
 fi
 
 ACTUAL_SHA=$(shasum -a 256 "$SCRIPT" | cut -d' ' -f1)
-if [[ "$EXPECTED_SHA" == "skip" || "$EXPECTED_SHA" == "dfb35a17bcb34617893e664a722715ee3e5ad21a8af78422f3df495a6fcb8b3d" ]]; then
+# Anything that is not 64 hex characters is not a checksum: an unreplaced
+# placeholder, an empty value, or an explicit "skip". Matching on the literal
+# placeholder text would be fragile — a release script that rewrites it
+# everywhere would disable verification without changing a visible line.
+if [[ "$EXPECTED_SHA" == "skip" ]] || [[ ! "$EXPECTED_SHA" =~ ^[0-9a-f]{64}$ ]]; then
   warn "Checksum not verified (${EXPECTED_SHA})."
   warn "SHA-256 is ${ACTUAL_SHA}"
 elif [[ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]]; then
