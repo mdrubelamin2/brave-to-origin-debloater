@@ -20,9 +20,13 @@
 #   ORIGIN_SOURCE  local file or URL to use instead of downloading
 # =============================================================================
 
-[CmdletBinding()]
+# No [CmdletBinding()] and no [ValidateSet] on $Action, deliberately. The
+# documented entry point is `irm ... | iex`, which evaluates this text in the
+# caller's own scope: PowerShell then tries to attach each attribute to a
+# variable holding the parameter's default, and ValidateSet rejects the empty
+# string before a single line of this script runs. The action is validated a
+# few lines below instead, where a wrong value can produce a useful message.
 param(
-    [ValidateSet('activate', 'deactivate', 'status')]
     [string]$Action,
     [string]$Channel,
     [switch]$User,
@@ -33,10 +37,16 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
+$ValidActions = @('activate', 'deactivate', 'status')
+if ($Action -and $ValidActions -notcontains $Action) {
+    [Console]::Error.WriteLine("Unknown -Action '$Action'. Use one of: $($ValidActions -join ', ')")
+    exit 1
+}
+
 $Repo = 'mdrubelamin2/brave-to-origin'
 # Pinned, not a moving branch: piping a URL to an elevated shell should not
 # mean "whatever that branch says today". Bump both together at a release.
-$PinnedRef = 'v1.2.0'
+$PinnedRef = 'v1.2.1'
 $PinnedSha256 = '1a2f3e2c46108197810aaf7d8aefcb2dc3e371ce474d3f2fa917d5f99c4590e3'
 
 $Ref = if ($env:ORIGIN_REF) { $env:ORIGIN_REF } else { $PinnedRef }

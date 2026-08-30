@@ -25,7 +25,7 @@ set -euo pipefail
 REPO="mdrubelamin2/brave-to-origin"
 # Pinned, not a moving branch: piping a URL to root should not mean "whatever
 # that branch says today". Bump both together when cutting a release.
-PINNED_REF="v1.2.0"
+PINNED_REF="v1.2.1"
 PINNED_SHA256="0760d69f427029b04a7a9518bb6407918768b7d91320493d34138977787a6880"
 
 REF="${ORIGIN_REF:-$PINNED_REF}"

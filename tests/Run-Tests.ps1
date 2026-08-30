@@ -264,6 +264,24 @@ Test-Case 'installer refuses an unpinned checksum instead of warning' {
     (Assert-True ($joined -notmatch 'Environment') 'must not have run origin.ps1')
 }
 
+# The documented Windows path is `irm ... | iex`, which evaluates the script
+# text in the CALLER's scope. A param block with [ValidateSet] then tries to
+# attach that attribute to a variable holding the empty default, and the run
+# dies before a single line executes. Invoking with -File never sees this, so
+# every other installer test here misses it.
+Test-Case 'installer survives being run through iex with no arguments' {
+    $inst = New-InstallerSandbox -Root $script:S.Root -ScanRoot (Join-Path $script:S.Root 'ProgramFiles')
+    $env:ORIGIN_SOURCE = $script:S.Script
+    try {
+        # Answers for the action and channel prompts, so the run does not block.
+        $out = "3`n1`n" | & pwsh -NoProfile -Command "`$t = Get-Content -Raw '$inst'; `$t | Invoke-Expression" 2>&1
+    } finally { Remove-Item Env:ORIGIN_SOURCE -EA SilentlyContinue }
+    $joined = ($out -join "`n")
+    (Assert-True ($joined -notmatch 'attribute cannot be added') 'param block must survive iex') -and
+    (Assert-True ($joined -notmatch 'ValidateSetFailure') 'no ValidateSet failure') -and
+    (Assert-True ($joined -match 'Brave to Origin') 'must reach the banner')
+}
+
 # --- summary -----------------------------------------------------------------
 Write-Host ''
 if ($script:Fail -eq 0) {
